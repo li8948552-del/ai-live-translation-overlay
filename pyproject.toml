@@ -1,0 +1,32 @@
+[project]
+name = "ai-live-translation-overlay"
+version = "1.1.0"
+description = "macOS live Japanese transcription and OpenAI Chinese translation overlay."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+  "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"live_translate_overlay.py" = ["B007", "B023", "SIM102", "SIM105", "SIM108"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+include = ["live_translation", "live_translate_overlay.py", "tests"]
+reportAttributeAccessIssue = false
+reportMissingImports = false
+reportMissingModuleSource = false
+reportSelfClsParameterName = false

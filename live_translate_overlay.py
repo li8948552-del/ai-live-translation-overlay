@@ -1,0 +1,4159 @@
+#!/usr/bin/env python3
+"""
+live_translate_overlay.py
+
+Streams macOS system audio via BlackHole, transcribes in short chunks with
+MLX Whisper, translates with OpenAI, and displays the result in a
+semi-transparent macOS window with a frosted-glass effect.
+
+Quick start:
+
+    brew install blackhole-2ch ffmpeg
+    pip install mlx-whisper sounddevice soundfile numpy pyobjc-framework-Cocoa
+
+    ./live_translate_overlay.py --target ru
+
+Translation uses the OpenAI Responses API. Set OPENAI_API_KEY before launch.
+
+Audio setup: create a Multi-Output Device
+(your headphones/speakers + BlackHole 2ch) and select it as system output.
+"""
+
+import argparse
+import gc
+import os
+import queue
+import re
+import signal
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import cast
+
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+
+from live_translation.sessions import (
+    SessionStore,
+    export_subtitles,
+    export_txt,
+    new_session,
+    session_summary,
+)
+from live_translation.text_pipeline import (
+    LANG_MENU,
+    WAITING_ORIGINAL,
+    WAITING_TRANSLATION,
+    absolute_words,
+    dedup_words_by_time,
+    language_label,
+    last_word_end_seconds,
+    merge_overlap_text,
+    merge_partial_buffer,
+    punctuated_context,
+    sentence_case_text,
+    strip_hallucinations,
+    take_blocks_for_translation,
+    take_confirmed_blocks_for_translation,
+    take_endpoint_blocks,
+)
+from live_translation.translators import LanguageSettings, OpenAITranslator
+
+WHISPER_MODELS = {
+    "small": "mlx-community/whisper-small-mlx",
+    "medium": "mlx-community/whisper-medium-mlx",
+    "turbo": "mlx-community/whisper-large-v3-turbo",
+    "large": "mlx-community/whisper-large-v3-mlx",
+}
+
+WHISPER_MENU = [
+    ("small", "Whisper Small"),
+    ("medium", "Whisper Medium"),
+    ("turbo", "Whisper Turbo"),
+    ("large", "Whisper Large"),
+]
+WHISPER_LABELS = dict(WHISPER_MENU)
+
+GEMMA_MODELS = {
+    "gpt-6-luna": "OpenAI GPT-6 Luna",
+}
+
+GEMMA_MENU = list(GEMMA_MODELS.items())
+SAVE_FORMAT_MENU = [
+    ("txt", "TXT"),
+    ("pdf", "PDF"),
+    ("srt", "SRT"),
+    ("vtt", "VTT"),
+]
+
+TEXT_COLOR_OPTIONS = [
+    ("white", "White", (1.0, 1.0, 1.0)),
+    ("graphite", "Graphite", (0.18, 0.19, 0.22)),
+    ("warm", "Warm", (1.0, 0.91, 0.76)),
+    ("cyan", "Cyan", (0.70, 0.93, 1.0)),
+    ("mint", "Mint", (0.72, 1.0, 0.84)),
+    ("rose", "Rose", (1.0, 0.76, 0.84)),
+]
+TEXT_COLOR_RGB = {code: rgb for code, _label, rgb in TEXT_COLOR_OPTIONS}
+
+TXT_SECTION_TITLES = {
+    "auto": ("ORIGINAL", "TRANSLATION"),
+    "en": ("TRANSCRIPTION", "TRANSLATION"),
+    "ru": ("ORIGINAL", "TRANSLATION"),
+    "es": ("TRANSCRIPCIÓN", "TRADUCCIÓN"),
+    "de": ("TRANSKRIPTION", "ÜBERSETZUNG"),
+    "fr": ("TRANSCRIPTION", "TRADUCTION"),
+    "it": ("TRASCRIZIONE", "TRADUZIONE"),
+    "pt": ("TRANSCRIÇÃO", "TRADUÇÃO"),
+    "uk": ("ORIGINAL", "TRANSLATION"),
+    "ja": ("日本語原文", "中文翻译"),
+    "zh": ("转录", "翻译"),
+}
+
+DEFAULT_AUDIO_QUEUE_BLOCKS = 120
+STREAM_CATCHUP_HIGH_WATER = 40
+STREAM_CATCHUP_KEEP_BLOCKS = 8
+NO_SPEECH_KEEP_AUDIO_BLOCKS = 2
+NO_SPEECH_STATUS_SECONDS = 4.0
+CHUNK_CATCHUP_KEEP_CHUNKS = 2
+CHUNK_PRODUCER_KEEP_CHUNKS = 1
+TRANSLATION_QUEUE_KEEP_TASKS = 1
+SLOW_STEP_LOG_SECONDS = 6.0
+STATUS_UPDATE_INTERVAL_SECONDS = 0.25
+TRANSLATION_TAIL_REGROUP_SECONDS = 8.0
+TRANSLATION_TAIL_MAX_MERGED_CHARS = 420
+TRANSLATION_TAIL_MAX_SOURCE_MERGED_CHARS = 1400
+TRANSLATION_MAX_DYNAMIC_TOKENS = 900
+# Recent committed source->translation pairs fed back to the translator as context for
+# consistent terminology/pronouns across blocks. Bounded to keep prompt size (latency) low.
+TRANSLATION_HISTORY_MAX_PAIRS = 2
+TRANSLATION_HISTORY_MAX_CHARS = 700
+
+ELLIPSIS_END_RE = re.compile(r"(?:\.{2,}|…)\s*$")
+SOFT_END_RE = re.compile(r"(?:[!?]+|(?<!\.)\.(?!\.))\s*$")
+
+
+def starts_like_continuation(text):
+    text = str(text or "").lstrip()
+    if not text:
+        return False
+    if text[0] in ",;:)-—–":
+        return True
+    for char in text:
+        if char.isalpha():
+            return char.islower()
+        if char.isdigit():
+            return False
+    return False
+
+
+def translation_token_budget(text, base_tokens):
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    base_tokens = int(base_tokens or 180)
+    # Translation into Russian often expands versus Spanish/English. The default
+    # live limit is intentionally small for latency, but polished merged paragraphs
+    # need enough room to finish instead of stopping mid-word.
+    estimated = int(len(text) * 0.9) + 96
+    return max(base_tokens, min(TRANSLATION_MAX_DYNAMIC_TOKENS, estimated))
+
+
+def find_blackhole():
+    for idx, dev in enumerate(sd.query_devices()):
+        dev = cast(dict, dev)  # sounddevice yields dict-like entries
+        if dev["max_input_channels"] > 0 and "blackhole" in dev["name"].lower():
+            return idx, dev["name"]
+    return None, None
+
+
+def list_devices():
+    print(sd.query_devices())
+    print("\nLook for the BlackHole input device. Pass its index via --device N.")
+
+
+class ConsoleOverlay:
+    def __init__(self, stop_event, show_partial=False):
+        self.stop_event = stop_event
+        self.show_partial = show_partial
+
+    def post_pair(
+        self,
+        source,
+        translated,
+        pause_ms=0,
+        replace_translation_tail=False,
+        combined_source=None,
+        append_source=True,
+        source_language=None,
+        start_seconds=None,
+        end_seconds=None,
+        confidence=None,
+    ):
+        if append_source and source:
+            print("\n--- transcript ---")
+            print(source)
+        print("--- translation" + (" (revised) ---" if replace_translation_tail else " ---"))
+        print(translated, flush=True)
+
+    def post_source(self, source, pause_ms=0):
+        if source:
+            print("\n--- transcript ---")
+            print(source, flush=True)
+
+    def post_status(self, lag_chunks):
+        if lag_chunks:
+            print(f"lag: {lag_chunks} chunks", flush=True)
+
+    def post_status_text(self, text, alpha=0.72):
+        if text:
+            print(str(text), flush=True)
+
+    def post_partial(self, source):
+        if self.show_partial and source:
+            print("\n--- partial ---")
+            print(source, flush=True)
+
+    def post_partial_translation(self, translated):
+        pass  # console shows only the final translation via post_pair
+
+    def run(self):
+        while not self.stop_event.is_set():
+            time.sleep(0.2)
+
+    def stop(self):
+        self.stop_event.set()
+
+
+_GLASS_PDF_VIEW_CLASS = None
+
+
+def _glass_pdf_view_class():
+    """Lazily build & cache a flipped NSView subclass that vector-draws the
+    'liquid glass' PDF: a soft diagonal gradient backdrop, frosted rounded cards
+    with a hairline rim and a soft drop shadow, and the transcript text on top.
+
+    Cached because an Obj-C class can only be registered once per process; and
+    built lazily so importing this module (e.g. for --help) doesn't pull AppKit."""
+    global _GLASS_PDF_VIEW_CLASS
+    if _GLASS_PDF_VIEW_CLASS is not None:
+        return _GLASS_PDF_VIEW_CLASS
+
+    import objc
+    from AppKit import (
+        NSBezierPath,
+        NSColor,
+        NSGraphicsContext,
+        NSShadow,
+        NSStringDrawingUsesLineFragmentOrigin,
+        NSView,
+    )
+
+    class _GlassPDFView(NSView):
+        def initWithFrame_(self, frame):
+            self = objc.super(_GlassPDFView, self).initWithFrame_(frame)
+            if self is None:
+                return None
+            self._gradient = None
+            self._cards = []   # list of NSRect (card backgrounds)
+            self._texts = []   # list of (NSAttributedString, NSRect)
+            return self
+
+        def isFlipped(self):  # top-down layout
+            return True
+
+        def drawRect_(self, _dirty):
+            bounds = self.bounds()
+            if self._gradient is not None:
+                self._gradient.drawInRect_angle_(bounds, -60.0)
+
+            fill = NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.62)
+            rim = NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.9)
+            card_radius = float(getattr(self, "_card_radius", 20.0))
+            shadow_blur = float(getattr(self, "_shadow_blur", 16.0))
+            for rect in self._cards:
+                path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                    rect, card_radius, card_radius
+                )
+                NSGraphicsContext.saveGraphicsState()
+                shadow = NSShadow.alloc().init()
+                shadow.setShadowColor_(NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.13))
+                shadow.setShadowBlurRadius_(shadow_blur)
+                shadow.setShadowOffset_((0.0, 3.0))  # flipped view -> downward
+                shadow.set()
+                fill.set()
+                path.fill()
+                NSGraphicsContext.restoreGraphicsState()
+                rim.set()
+                path.setLineWidth_(1.0)
+                path.stroke()
+
+            for attr, rect in self._texts:
+                attr.drawWithRect_options_(rect, NSStringDrawingUsesLineFragmentOrigin)
+
+    _GLASS_PDF_VIEW_CLASS = _GlassPDFView
+    return _GLASS_PDF_VIEW_CLASS
+
+
+class GlassOverlay:
+    def __init__(self, stop_event, settings: LanguageSettings, title, width, height, opacity, show_partial=False):
+        try:
+            from Cocoa import (
+                NSApp,
+                NSApplication,
+                NSApplicationActivationPolicyRegular,
+                NSBackingStoreBuffered,
+                NSButton,
+                NSColor,
+                NSFloatingWindowLevel,
+                NSFont,
+                NSFontAttributeName,
+                NSForegroundColorAttributeName,
+                NSMakeRange,
+                NSMakeRect,
+                NSMakeSize,
+                NSMomentaryPushInButton,
+                NSMutableAttributedString,
+                NSNormalWindowLevel,
+                NSObject,
+                NSOffState,
+                NSOnState,
+                NSPopUpButton,
+                NSScrollView,
+                NSSwitchButton,
+                NSTextField,
+                NSTextView,
+                NSView,
+                NSViewHeightSizable,
+                NSViewWidthSizable,
+                NSVisualEffectBlendingModeBehindWindow,
+                NSVisualEffectMaterialHUDWindow,
+                NSVisualEffectStateActive,
+                NSVisualEffectView,
+                NSWindow,
+                NSWindowCollectionBehaviorCanJoinAllSpaces,
+                NSWindowCollectionBehaviorFullScreenAuxiliary,
+                NSWindowStyleMaskClosable,
+                NSWindowStyleMaskFullSizeContentView,
+                NSWindowStyleMaskResizable,
+                NSWindowStyleMaskTitled,
+            )
+            from PyObjCTools import AppHelper
+        except ImportError as exc:
+            raise RuntimeError(
+                "For the glass window install `pip install pyobjc-framework-Cocoa`."
+            ) from exc
+
+        self.AppHelper = AppHelper
+        self.NSMakeRange = NSMakeRange
+        self.NSMakeRect = NSMakeRect
+        self.NSMakeSize = NSMakeSize
+        self.NSButton = NSButton
+        self.NSColor = NSColor
+        self.NSFont = NSFont
+        self.NSFontAttributeName = NSFontAttributeName
+        self.NSForegroundColorAttributeName = NSForegroundColorAttributeName
+        self.NSNormalWindowLevel = NSNormalWindowLevel
+        self.NSFloatingWindowLevel = NSFloatingWindowLevel
+        self.NSOffState = NSOffState
+        self.NSOnState = NSOnState
+        self.NSMutableAttributedString = NSMutableAttributedString
+        self.NSMomentaryPushInButton = NSMomentaryPushInButton
+        self.NSSwitchButton = NSSwitchButton
+        self.NSView = NSView
+        self.NSViewHeightSizable = NSViewHeightSizable
+        self.NSViewWidthSizable = NSViewWidthSizable
+        self.stop_event = stop_event
+        self.settings = settings
+        self.original_text = ""
+        self.partial_text = ""
+        self.partial_translation = ""
+        self.show_partial = show_partial
+        self.translated_text = ""
+        self.original_blocks = []
+        self.translation_blocks = []
+        self.history_pairs = []  # full, uncapped transcript+translation for export
+        self.session_store = SessionStore()
+        self.current_session = self._new_current_session()
+        self.session_time_offset_seconds = 0.0
+        self.session_started_at = time.monotonic()
+        self._last_status_posted_at = 0.0
+        self._last_status_value = 0
+        self._last_status_text = ""
+        self.font_size = 20
+        self.compact_mode = False
+        self.pin_enabled = True
+        self.settings_visible = False
+        self.settings_tab = "models"
+        self.history_visible = False
+        self.save_visible = False
+        self.text_color_visible = False
+        self.text_color_code = "white"
+        self.app = NSApplication.sharedApplication()
+        self.app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+
+        class MenuTarget(NSObject):
+            def compactChanged_(menu_self, sender):
+                self._compact_changed(sender)
+
+            def pinChanged_(menu_self, sender):
+                self._pin_changed(sender)
+
+            def smallerText_(menu_self, sender):
+                self._adjust_text_size(-1)
+
+            def largerText_(menu_self, sender):
+                self._adjust_text_size(1)
+
+            def sourceChanged_(menu_self, sender):
+                self._source_changed(sender)
+
+            def targetChanged_(menu_self, sender):
+                self._target_changed(sender)
+
+            def clearAll_(menu_self, sender):
+                self._clear_all(sender)
+
+            def saveToggled_(menu_self, sender):
+                self._save_toggled(sender)
+
+            def saveFormatSelected_(menu_self, sender):
+                self._save_selected_format(sender)
+
+            def saveFormatButton_(menu_self, sender):
+                self._save_format_button(sender)
+
+            def historyToggled_(menu_self, sender):
+                self._history_toggled(sender)
+
+            def settingsModels_(menu_self, sender):
+                self._settings_models_tab(sender)
+
+            def settingsHistory_(menu_self, sender):
+                self._settings_history_tab(sender)
+
+            def historyChanged_(menu_self, sender):
+                self._history_changed(sender)
+
+            def historyOpen_(menu_self, sender):
+                self._history_open(sender)
+
+            def historyContinue_(menu_self, sender):
+                self._history_continue(sender)
+
+            def historyRename_(menu_self, sender):
+                self._history_rename(sender)
+
+            def historyDelete_(menu_self, sender):
+                self._history_delete(sender)
+
+            def settingsToggled_(menu_self, sender):
+                self._settings_toggled(sender)
+
+            def textColorToggled_(menu_self, sender):
+                self._text_color_toggled(sender)
+
+            def textColorChanged_(menu_self, sender):
+                self._text_color_changed(sender)
+
+            def whisperChanged_(menu_self, sender):
+                self._whisper_changed(sender)
+
+            def ollamaModelChanged_(menu_self, sender):
+                self._ollama_model_changed(sender)
+
+        class WindowDelegate(NSObject):
+            def windowDidResize_(delegate_self, notification):
+                self._relayout()
+
+        self.menu_target = MenuTarget.alloc().init()
+        self.window_delegate = WindowDelegate.alloc().init()
+
+        frame = NSMakeRect(120, 700, width, height)
+        style = (
+            NSWindowStyleMaskTitled
+            | NSWindowStyleMaskClosable
+            | NSWindowStyleMaskResizable
+            | NSWindowStyleMaskFullSizeContentView
+        )
+        self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            frame,
+            style,
+            NSBackingStoreBuffered,
+            False,
+        )
+        self._layout_ready = False
+        self.window.setDelegate_(self.window_delegate)
+        self.window.setContentMinSize_(NSMakeSize(420, 220))
+        self.window.setTitle_(title)
+        self.window.setTitlebarAppearsTransparent_(True)
+        self.window.setMovableByWindowBackground_(True)
+        self.window.setOpaque_(False)
+        self.window.setBackgroundColor_(NSColor.clearColor())
+        self.window.setAlphaValue_(1.0)
+        self.window.setLevel_(NSFloatingWindowLevel)
+        self.window.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+
+        content = self.window.contentView()
+        visual = NSVisualEffectView.alloc().initWithFrame_(content.bounds())
+        visual.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        visual.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        visual.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        visual.setState_(NSVisualEffectStateActive)
+        content.addSubview_(visual)
+
+        inset = 18
+        menu_height = 70
+        column_label_height = 20
+        gap = 32
+        column_width = int((width - inset * 2 - gap) / 2)
+        scroll_height = height - inset * 2 - menu_height - column_label_height
+        scroll_y = inset
+        label_y = scroll_y + scroll_height + 6
+        menu_y = label_y + column_label_height + 18
+        button_h = 28
+        item_gap = 6
+        group_gap = 18
+        status_width = 156
+        target_width = 140
+        source_width = 126
+        controls_x = inset
+        compact_x = controls_x
+        pin_x = compact_x + 78 + item_gap
+        source_label_x = pin_x + 48 + group_gap
+        source_popup_x = source_label_x + 36
+        target_label_x = source_popup_x + source_width + 14
+        target_popup_x = target_label_x + 24
+        status_x = width - inset - status_width
+        settings_x = status_x - group_gap - 32
+        history_x = settings_x - item_gap - 66
+        save_x = history_x - group_gap - 56
+        clear_x = save_x - item_gap - 40
+        text_color_x = clear_x - group_gap - 32
+        larger_x = text_color_x - item_gap - 32
+        smaller_x = larger_x - item_gap - 32
+
+        self.compact_button = self._make_button(
+            NSMakeRect(compact_x, menu_y, 78, button_h),
+            "Compact",
+            "compactChanged:",
+            momentary=True,
+        )
+        self.pin_button = self._make_button(
+            NSMakeRect(pin_x, menu_y, 48, button_h),
+            "Pin",
+            "pinChanged:",
+        )
+        self.pin_button.setState_(NSOnState)
+        self.smaller_button = self._make_button(
+            NSMakeRect(smaller_x, menu_y, 32, button_h),
+            "A-",
+            "smallerText:",
+            momentary=True,
+        )
+        self.larger_button = self._make_button(
+            NSMakeRect(larger_x, menu_y, 32, button_h),
+            "A+",
+            "largerText:",
+            momentary=True,
+        )
+        self.text_color_button = self._make_button(
+            NSMakeRect(text_color_x, menu_y, 32, button_h),
+            "Color",
+            "textColorToggled:",
+            momentary=True,
+        )
+        self._set_text_color_icon(self.text_color_button)
+        self.clear_button = self._make_button(
+            NSMakeRect(clear_x, menu_y, 40, button_h),
+            "Clear",
+            "clearAll:",
+            momentary=True,
+        )
+        self._set_trash_icon(self.clear_button)
+        self.save_button = self._make_button(
+            NSMakeRect(save_x, menu_y, 56, button_h),
+            "Save",
+            "saveToggled:",
+            momentary=True,
+        )
+        self.history_button = self._make_button(
+            NSMakeRect(history_x, menu_y, 66, button_h),
+            "History",
+            "historyToggled:",
+            momentary=True,
+        )
+        self.settings_button = self._make_button(
+            NSMakeRect(settings_x, menu_y, 32, button_h),
+            "Settings",
+            "settingsToggled:",
+            momentary=True,
+        )
+        self._set_gear_icon(self.settings_button)
+        for control in (
+            self.compact_button,
+            self.pin_button,
+            self.smaller_button,
+            self.larger_button,
+            self.text_color_button,
+            self.clear_button,
+            self.save_button,
+            self.history_button,
+            self.settings_button,
+        ):
+            visual.addSubview_(control)
+
+        self.source_popup = self._make_popup(
+            NSPopUpButton,
+            NSMakeRect(source_popup_x, menu_y, source_width, 28),
+            LANG_MENU,
+            self.settings.get()[0],
+            "sourceChanged:",
+        )
+        self.target_popup = self._make_popup(
+            NSPopUpButton,
+            NSMakeRect(target_popup_x, menu_y, target_width, 28),
+            [item for item in LANG_MENU if item[0] != "auto"],
+            self.settings.get()[1],
+            "targetChanged:",
+        )
+
+        self.source_label = self._make_label(
+            NSTextField,
+            "From",
+            NSMakeRect(source_label_x, menu_y + 5, 34, 18),
+            size=12,
+            alpha=0.72,
+        )
+        visual.addSubview_(self.source_label)
+        visual.addSubview_(self.source_popup)
+        self.target_label = self._make_label(
+            NSTextField,
+            "To",
+            NSMakeRect(target_label_x, menu_y + 5, 22, 18),
+            size=12,
+            alpha=0.72,
+        )
+        visual.addSubview_(self.target_label)
+        visual.addSubview_(self.target_popup)
+        self.status_label = self._make_label(
+            NSTextField,
+            "lag: 0 chunks",
+            NSMakeRect(status_x, menu_y + 5, status_width, 18),
+            size=12,
+            alpha=0.62,
+        )
+        visual.addSubview_(self.status_label)
+
+        settings_panel_w = 456
+        settings_panel_h = 116
+        self.settings_panel = NSVisualEffectView.alloc().initWithFrame_(
+            NSMakeRect(width - inset - settings_panel_w, menu_y - settings_panel_h - 10, settings_panel_w, settings_panel_h)
+        )
+        self.settings_panel.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        self.settings_panel.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        self.settings_panel.setState_(NSVisualEffectStateActive)
+        self.settings_panel.setHidden_(True)
+        self.settings_panel.setWantsLayer_(True)
+        try:
+            self.settings_panel.layer().setCornerRadius_(14.0)
+            self.settings_panel.layer().setMasksToBounds_(True)
+        except Exception:
+            pass
+        visual.addSubview_(self.settings_panel)
+
+        self.save_panel = NSVisualEffectView.alloc().initWithFrame_(
+            NSMakeRect(width - inset - 310, menu_y - 126, 310, 116)
+        )
+        self.save_panel.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        self.save_panel.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        self.save_panel.setState_(NSVisualEffectStateActive)
+        self.save_panel.setHidden_(True)
+        self.save_panel.setWantsLayer_(True)
+        try:
+            self.save_panel.layer().setCornerRadius_(14.0)
+            self.save_panel.layer().setMasksToBounds_(True)
+        except Exception:
+            pass
+        visual.addSubview_(self.save_panel)
+
+        self.history_panel = NSVisualEffectView.alloc().initWithFrame_(
+            NSMakeRect(width - inset - 620, menu_y - 126, 620, 116)
+        )
+        self.history_panel.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        self.history_panel.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        self.history_panel.setState_(NSVisualEffectStateActive)
+        self.history_panel.setHidden_(True)
+        self.history_panel.setWantsLayer_(True)
+        try:
+            self.history_panel.layer().setCornerRadius_(14.0)
+            self.history_panel.layer().setMasksToBounds_(True)
+        except Exception:
+            pass
+        visual.addSubview_(self.history_panel)
+
+        self.text_color_panel = NSVisualEffectView.alloc().initWithFrame_(
+            NSMakeRect(inset + 300, menu_y - 126, 304, 116)
+        )
+        self.text_color_panel.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        self.text_color_panel.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        self.text_color_panel.setState_(NSVisualEffectStateActive)
+        self.text_color_panel.setHidden_(True)
+        self.text_color_panel.setWantsLayer_(True)
+        try:
+            self.text_color_panel.layer().setCornerRadius_(14.0)
+            self.text_color_panel.layer().setMasksToBounds_(True)
+        except Exception:
+            pass
+        visual.addSubview_(self.text_color_panel)
+
+        self.text_color_label = self._make_label(
+            NSTextField,
+            "Text color",
+            NSMakeRect(14, 82, 72, 18),
+            size=12,
+            alpha=0.72,
+        )
+        self.text_color_buttons = {}
+        for idx, (code, label, rgb) in enumerate(TEXT_COLOR_OPTIONS):
+            button = self._make_color_swatch_button(
+                NSMakeRect(96 + idx * 34, 80, 26, 20),
+                code,
+                label,
+                rgb,
+                idx,
+            )
+            self.text_color_buttons[code] = button
+        self.text_color_panel.addSubview_(self.text_color_label)
+        for button in self.text_color_buttons.values():
+            self.text_color_panel.addSubview_(button)
+        self._refresh_text_color_buttons()
+
+        self.save_format_label = self._make_label(
+            NSTextField,
+            "Save as",
+            NSMakeRect(14, 82, 58, 18),
+            size=12,
+            alpha=0.72,
+        )
+        self.save_format_buttons = {}
+        for idx, (code, label) in enumerate(SAVE_FORMAT_MENU):
+            btn = self._make_button(
+                NSMakeRect(82 + idx * 54, 77, 46, 28),
+                label,
+                "saveFormatButton:",
+                momentary=True,
+            )
+            btn.setTag_(idx)
+            self.save_format_buttons[code] = btn
+        self.save_panel.addSubview_(self.save_format_label)
+        for btn in self.save_format_buttons.values():
+            self.save_panel.addSubview_(btn)
+
+        self.whisper_settings_label = self._make_label(
+            NSTextField,
+            "STT",
+            NSMakeRect(36, 88, 40, 18),
+            size=12,
+            alpha=0.72,
+        )
+        self.whisper_popup = self._make_popup(
+            NSPopUpButton,
+            NSMakeRect(82, 82, 142, 28),
+            WHISPER_MENU,
+            self.settings.get_whisper_size(),
+            "whisperChanged:",
+        )
+        self.model_settings_label = self._make_label(
+            NSTextField,
+            "LLM",
+            NSMakeRect(278, 88, 54, 18),
+            size=12,
+            alpha=0.72,
+        )
+        self.ollama_model_popup = self._make_popup(
+            NSPopUpButton,
+            NSMakeRect(320, 82, 138, 28),
+            GEMMA_MENU,
+            self.settings.get_ollama_model(),
+            "ollamaModelChanged:",
+        )
+        self.history_session_label = None
+        self.history_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(14, 84, 592, 28),
+            False,
+        )
+        self.history_popup.setTarget_(self.menu_target)
+        self.history_popup.setAction_("historyChanged:")
+        self.history_detail_label = None
+        self.history_open_button = self._make_button(
+            NSMakeRect(60, 22, 70, 26),
+            "Open",
+            "historyOpen:",
+            momentary=True,
+        )
+        self.history_continue_button = self._make_button(
+            NSMakeRect(136, 22, 88, 26),
+            "Continue",
+            "historyContinue:",
+            momentary=True,
+        )
+        self.history_rename_button = self._make_button(
+            NSMakeRect(232, 22, 78, 26),
+            "Rename",
+            "historyRename:",
+            momentary=True,
+        )
+        self.history_delete_button = self._make_button(
+            NSMakeRect(318, 22, 70, 26),
+            "Delete",
+            "historyDelete:",
+            momentary=True,
+        )
+        self.history_action_buttons = [
+            self.history_open_button,
+            self.history_continue_button,
+            self.history_rename_button,
+            self.history_delete_button,
+        ]
+        self.settings_model_controls = [
+            self.whisper_settings_label,
+            self.whisper_popup,
+            self.model_settings_label,
+            self.ollama_model_popup,
+        ]
+        self.settings_history_controls = [
+            self.history_popup,
+            *self.history_action_buttons,
+        ]
+        for control in (
+            self.whisper_settings_label,
+            self.whisper_popup,
+            self.model_settings_label,
+            self.ollama_model_popup,
+        ):
+            self.settings_panel.addSubview_(control)
+        for control in (self.history_popup, *self.history_action_buttons):
+            self.history_panel.addSubview_(control)
+
+        left_x = inset
+        right_x = inset + column_width + gap
+        divider_x = inset + column_width + int(gap / 2)
+        divider_height = scroll_height + column_label_height + 2
+        self.expanded_frames = {
+            "left_scroll": NSMakeRect(left_x, scroll_y, divider_x - left_x - 2, scroll_height),
+            "right_scroll": NSMakeRect(right_x, scroll_y, width - right_x, scroll_height),
+            "original_label": NSMakeRect(left_x, label_y, column_width, 18),
+            "translation_label": NSMakeRect(right_x, label_y, column_width, 18),
+        }
+        self.compact_frames = {
+            # Right edge flush to the window border (x == width) so the overlay
+            # scrollbar tucks against the edge exactly like in expanded mode; keep the
+            # left inset for text padding.
+            "right_scroll": NSMakeRect(inset, scroll_y, width - inset, scroll_height),
+            "translation_label": NSMakeRect(inset, label_y, width - inset * 2, 18),
+        }
+        self.divider_shadow = self._make_line(
+            NSMakeRect(divider_x - 1, scroll_y, 1, divider_height),
+            NSColor.blackColor().colorWithAlphaComponent_(0.36),
+        )
+        self.divider_highlight = self._make_line(
+            NSMakeRect(divider_x, scroll_y, 1, divider_height),
+            NSColor.whiteColor().colorWithAlphaComponent_(0.12),
+        )
+        visual.addSubview_(self.divider_shadow)
+        visual.addSubview_(self.divider_highlight)
+        self.original_label = self._make_label(
+            NSTextField,
+            "Original",
+            self.expanded_frames["original_label"],
+            size=12,
+            alpha=0.62,
+        )
+        self.translation_label = self._make_label(
+            NSTextField,
+            "Translation",
+            self.expanded_frames["translation_label"],
+            size=12,
+            alpha=0.62,
+        )
+        visual.addSubview_(self.original_label)
+        visual.addSubview_(self.translation_label)
+
+        self.left_scroll = NSScrollView.alloc().initWithFrame_(self.expanded_frames["left_scroll"])
+        self.right_scroll = NSScrollView.alloc().initWithFrame_(self.expanded_frames["right_scroll"])
+        self.left_scroll.setAutoresizingMask_(0)
+        self.right_scroll.setAutoresizingMask_(0)
+        self.left_scroll.setDrawsBackground_(False)
+        self.right_scroll.setDrawsBackground_(False)
+        self.left_scroll.setHasVerticalScroller_(True)
+        self.right_scroll.setHasVerticalScroller_(True)
+        # Thin, modern overlay scrollbars with a light knob (for the dark glass), that
+        # float at the very edge and auto-hide when idle.
+        try:
+            from AppKit import NSScrollerKnobStyleLight, NSScrollerStyleOverlay
+
+            for scroll in (self.left_scroll, self.right_scroll):
+                scroll.setScrollerStyle_(NSScrollerStyleOverlay)
+                scroll.setAutohidesScrollers_(True)
+                scroller = scroll.verticalScroller()
+                if scroller is not None:
+                    scroller.setKnobStyle_(NSScrollerKnobStyleLight)
+        except Exception:
+            pass
+        visual.addSubview_(self.left_scroll)
+        visual.addSubview_(self.right_scroll)
+
+        self.original_view = self._make_text_view(NSTextView, self.left_scroll)
+        self.translated_view = self._make_text_view(NSTextView, self.right_scroll)
+        self.original_view.setString_(WAITING_ORIGINAL)
+        self.translated_view.setString_(self._waiting_translation())
+        self.left_scroll.setDocumentView_(self.original_view)
+        self.right_scroll.setDocumentView_(self.translated_view)
+        self.save_panel.removeFromSuperview()
+        visual.addSubview_(self.save_panel)
+        self.settings_panel.removeFromSuperview()
+        visual.addSubview_(self.settings_panel)
+        self.history_panel.removeFromSuperview()
+        visual.addSubview_(self.history_panel)
+        self.text_color_panel.removeFromSuperview()
+        visual.addSubview_(self.text_color_panel)
+
+        self.NSApp = NSApp
+        self._layout_ready = True
+        self._relayout()
+
+    def _relayout(self):
+        if not getattr(self, "_layout_ready", False):
+            return
+        size = self.window.contentView().bounds().size
+        width = size.width
+        height = size.height
+        inset = 18
+        menu_height = 70
+        column_label_height = 20
+        gap = 32
+        column_width = int((width - inset * 2 - gap) / 2)
+        scroll_height = height - inset * 2 - menu_height - column_label_height
+        if scroll_height < 1:
+            scroll_height = 1
+        scroll_y = inset
+        label_y = scroll_y + scroll_height + 6
+        menu_y = label_y + column_label_height + 18
+        button_h = 28
+        item_gap = 6
+        group_gap = 18
+        status_width = 156
+        target_width = 140
+        source_width = 126
+        status_x = width - inset - status_width
+        settings_x = status_x - group_gap - 32
+        history_x = settings_x - item_gap - 66
+        save_x = history_x - group_gap - 56
+        clear_x = save_x - item_gap - 40
+        text_color_x = clear_x - group_gap - 32
+        larger_x = text_color_x - item_gap - 32
+        smaller_x = larger_x - item_gap - 32
+        compact_x = inset
+        pin_x = compact_x + 78 + item_gap
+        source_label_x = pin_x + 48 + group_gap
+        source_popup_x = source_label_x + 36
+        target_label_x = source_popup_x + source_width + 14
+        target_popup_x = target_label_x + 24
+
+        self.compact_button.setFrame_(self.NSMakeRect(compact_x, menu_y, 78, button_h))
+        self.pin_button.setFrame_(self.NSMakeRect(pin_x, menu_y, 48, button_h))
+        self.smaller_button.setFrame_(self.NSMakeRect(smaller_x, menu_y, 32, button_h))
+        self.larger_button.setFrame_(self.NSMakeRect(larger_x, menu_y, 32, button_h))
+        self.text_color_button.setFrame_(self.NSMakeRect(text_color_x, menu_y, 32, button_h))
+
+        self.save_button.setFrame_(self.NSMakeRect(save_x, menu_y, 56, button_h))
+        self.history_button.setFrame_(self.NSMakeRect(history_x, menu_y, 66, button_h))
+        self.settings_button.setFrame_(self.NSMakeRect(settings_x, menu_y, 32, button_h))
+        self.clear_button.setFrame_(self.NSMakeRect(clear_x, menu_y, 40, button_h))
+        self.source_label.setFrame_(self.NSMakeRect(source_label_x, menu_y + 5, 34, 18))
+        self.source_popup.setFrame_(self.NSMakeRect(source_popup_x, menu_y, source_width, 28))
+        self.target_label.setFrame_(self.NSMakeRect(target_label_x, menu_y + 5, 22, 18))
+        self.target_popup.setFrame_(self.NSMakeRect(target_popup_x, menu_y, target_width, 28))
+        self.status_label.setFrame_(self.NSMakeRect(status_x, menu_y + 5, status_width, 18))
+
+        # Left language controls sit after Pin and are the last to disappear. Right-side
+        # controls hide first, from low-priority status/export/actions toward text controls.
+        language_end = target_popup_x + target_width
+        source_end = source_popup_x + source_width
+        edge = language_end + 12
+        show_status = status_x >= edge
+        show_save = save_x >= edge
+        show_history = history_x >= edge
+        show_settings = settings_x >= edge
+        show_clear = clear_x >= edge
+        show_text_color = text_color_x >= edge
+        show_larger = larger_x >= edge
+        show_smaller = smaller_x >= edge
+        show_target = width - inset >= language_end
+        show_source = width - inset >= source_end
+        self.save_button.setHidden_(not show_save)
+        self.history_button.setHidden_(not show_history)
+        self.settings_button.setHidden_(not show_settings)
+        self.clear_button.setHidden_(not show_clear)
+        self.save_panel.setHidden_((not self.save_visible) or (not show_save))
+        self.settings_panel.setHidden_((not self.settings_visible) or (not show_settings))
+        self.history_panel.setHidden_((not self.history_visible) or (not show_history))
+        self.smaller_button.setHidden_(not show_smaller)
+        self.larger_button.setHidden_(not show_larger)
+        self.text_color_button.setHidden_(not show_text_color)
+        self.text_color_panel.setHidden_((not self.text_color_visible) or (not show_text_color))
+        self.status_label.setHidden_(not show_status)
+        self.target_label.setHidden_(not show_target)
+        self.target_popup.setHidden_(not show_target)
+        self.source_label.setHidden_(not show_source)
+        self.source_popup.setHidden_(not show_source)
+
+        left_x = inset
+        right_x = inset + column_width + gap
+        divider_x = inset + column_width + int(gap / 2)
+        divider_height = scroll_height + column_label_height + 2
+        self.expanded_frames = {
+            "left_scroll": self.NSMakeRect(left_x, scroll_y, divider_x - left_x - 2, scroll_height),
+            "right_scroll": self.NSMakeRect(right_x, scroll_y, width - right_x, scroll_height),
+            "original_label": self.NSMakeRect(left_x, label_y, column_width, 18),
+            "translation_label": self.NSMakeRect(right_x, label_y, column_width, 18),
+        }
+        self.compact_frames = {
+            # Right edge flush to the window border (x == width) so the overlay
+            # scrollbar tucks against the edge exactly like in expanded mode; keep the
+            # left inset for text padding.
+            "right_scroll": self.NSMakeRect(inset, scroll_y, width - inset, scroll_height),
+            "translation_label": self.NSMakeRect(inset, label_y, width - inset * 2, 18),
+        }
+        self.divider_shadow.setFrame_(self.NSMakeRect(divider_x - 1, scroll_y, 1, divider_height))
+        self.divider_highlight.setFrame_(self.NSMakeRect(divider_x, scroll_y, 1, divider_height))
+        self.original_label.setFrame_(self.expanded_frames["original_label"])
+        self.left_scroll.setFrame_(self.expanded_frames["left_scroll"])
+        if self.compact_mode:
+            self.right_scroll.setFrame_(self.compact_frames["right_scroll"])
+            self.translation_label.setFrame_(self.compact_frames["translation_label"])
+        else:
+            self.right_scroll.setFrame_(self.expanded_frames["right_scroll"])
+            self.translation_label.setFrame_(self.expanded_frames["translation_label"])
+        self.original_view.setFrame_(self.left_scroll.contentView().bounds())
+        self.translated_view.setFrame_(self.right_scroll.contentView().bounds())
+        panel_w = min(456, max(300, width - inset * 2))
+        panel_h = 116
+        panel_x = max(inset, width - inset - panel_w)
+        panel_y = max(scroll_y + 8, menu_y - 126)
+        self.settings_panel.setFrame_(self.NSMakeRect(panel_x, panel_y, panel_w, panel_h))
+        self.whisper_settings_label.setFrame_(self.NSMakeRect(36, 88, 40, 18))
+        self.whisper_popup.setFrame_(self.NSMakeRect(82, 82, min(142, panel_w - 96), 28))
+        self.model_settings_label.setFrame_(self.NSMakeRect(278, 88, 54, 18))
+        self.ollama_model_popup.setFrame_(
+            self.NSMakeRect(320, 82, max(120, panel_w - 334), 28)
+        )
+        save_panel_w = 310
+        save_panel_h = 116
+        save_panel_x = width - inset - save_panel_w
+        save_panel_y = max(scroll_y + 8, menu_y - save_panel_h - 10)
+        self.save_panel.setFrame_(self.NSMakeRect(save_panel_x, save_panel_y, save_panel_w, save_panel_h))
+        self.save_format_label.setFrame_(self.NSMakeRect(14, 82, 58, 18))
+        for idx, btn in enumerate(self.save_format_buttons.values()):
+            btn.setFrame_(self.NSMakeRect(82 + idx * 54, 77, 46, 28))
+        history_panel_w = min(620, max(420, width - inset * 2))
+        history_panel_h = 116
+        history_panel_x = width - inset - history_panel_w
+        history_panel_y = max(scroll_y + 8, menu_y - 126)
+        self.history_panel.setFrame_(
+            self.NSMakeRect(history_panel_x, history_panel_y, history_panel_w, history_panel_h)
+        )
+        self.history_popup.setFrame_(self.NSMakeRect(14, 84, history_panel_w - 28, 28))
+        btn_right = history_panel_w - 14
+        self.history_delete_button.setFrame_(self.NSMakeRect(btn_right - 70, 22, 70, 26))
+        self.history_rename_button.setFrame_(self.NSMakeRect(btn_right - 70 - 6 - 78, 22, 78, 26))
+        self.history_continue_button.setFrame_(self.NSMakeRect(btn_right - 70 - 6 - 78 - 6 - 88, 22, 88, 26))
+        self.history_open_button.setFrame_(self.NSMakeRect(btn_right - 70 - 6 - 78 - 6 - 88 - 6 - 70, 22, 70, 26))
+        color_panel_h = 116
+        color_panel_w = min(320, max(304, width - inset * 2))
+        color_panel_x = width - inset - color_panel_w
+        color_panel_y = max(scroll_y + 8, menu_y - 126)
+        self.text_color_panel.setFrame_(
+            self.NSMakeRect(color_panel_x, color_panel_y, color_panel_w, color_panel_h)
+        )
+        self.text_color_label.setFrame_(self.NSMakeRect(14, 82, 72, 18))
+        swatch_x = 96
+        swatch_w = 26
+        swatch_gap = max(
+            5,
+            min(9, (color_panel_w - swatch_x - 14 - swatch_w * len(TEXT_COLOR_OPTIONS)) / 5),
+        )
+        for code, _label, _rgb in TEXT_COLOR_OPTIONS:
+            self.text_color_buttons[code].setFrame_(self.NSMakeRect(swatch_x, 80, swatch_w, 20))
+            swatch_x += swatch_w + swatch_gap
+        # Re-flow text into the new frames; without this the resized text views go blank.
+        self._render_original()
+        self._render_translation()
+
+    def _make_label(self, text_field_cls, value, frame, size, alpha):
+        label = text_field_cls.alloc().initWithFrame_(frame)
+        label.setStringValue_(value)
+        label.setBezeled_(False)
+        label.setDrawsBackground_(False)
+        label.setEditable_(False)
+        label.setSelectable_(False)
+        label.setTextColor_(self.NSColor.whiteColor().colorWithAlphaComponent_(alpha))
+        label.setFont_(self.NSFont.systemFontOfSize_weight_(size, 0.18))
+        return label
+
+    def _make_button(self, frame, title, action, momentary=False):
+        button = self.NSButton.alloc().initWithFrame_(frame)
+        button.setTitle_(title)
+        button.setButtonType_(self.NSMomentaryPushInButton if momentary else self.NSSwitchButton)
+        button.setBezelStyle_(1)
+        button.setTarget_(self.menu_target)
+        button.setAction_(action)
+        button.setFont_(self.NSFont.systemFontOfSize_weight_(12, 0.18))
+        return button
+
+    def _make_color_swatch_button(self, frame, code, label, rgb, tag):
+        button = self.NSButton.alloc().initWithFrame_(frame)
+        button.setTitle_("")
+        button.setButtonType_(self.NSMomentaryPushInButton)
+        button.setBordered_(False)
+        button.setTag_(tag)
+        button.setToolTip_(label)
+        button.setTarget_(self.menu_target)
+        button.setAction_("textColorChanged:")
+        button.setWantsLayer_(True)
+        layer = button.layer()
+        if layer is not None:
+            layer.setCornerRadius_(7.0)
+            layer.setBackgroundColor_(self._ns_color_from_rgb(rgb).CGColor())
+            layer.setBorderWidth_(1.0)
+            layer.setBorderColor_(self.NSColor.whiteColor().colorWithAlphaComponent_(0.28).CGColor())
+        return button
+
+    def _set_trash_icon(self, button):
+        # Native vector trash glyph (SF Symbol), tinted white to match the toolbar.
+        try:
+            from AppKit import NSImage, NSImageOnly
+
+            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_("trash", "Clear")
+            if img is not None:
+                button.setImage_(img)
+                button.setImagePosition_(NSImageOnly)
+                button.setTitle_("")
+                try:
+                    button.setContentTintColor_(self.NSColor.whiteColor())
+                except Exception:
+                    pass
+        except Exception:
+            pass  # fall back to the "Clear" text title
+
+    def _set_gear_icon(self, button):
+        try:
+            from AppKit import NSImage, NSImageOnly
+
+            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_("gearshape", "Settings")
+            if img is not None:
+                button.setImage_(img)
+                button.setImagePosition_(NSImageOnly)
+                button.setTitle_("")
+                try:
+                    button.setContentTintColor_(self.NSColor.whiteColor())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _set_text_color_icon(self, button):
+        try:
+            from AppKit import NSImage, NSImageOnly
+
+            img = None
+            for symbol in ("textformat", "paintbrush.pointed", "paintpalette"):
+                img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                    symbol,
+                    "Text color",
+                )
+                if img is not None:
+                    break
+            if img is not None:
+                button.setImage_(img)
+                button.setImagePosition_(NSImageOnly)
+                button.setTitle_("")
+                try:
+                    button.setContentTintColor_(self.NSColor.whiteColor())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _ns_color_from_rgb(self, rgb, alpha=1.0):
+        r, g, b = rgb
+        return self.NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, alpha)
+
+    def _text_color(self, alpha=1.0):
+        return self._ns_color_from_rgb(
+            TEXT_COLOR_RGB.get(self.text_color_code, TEXT_COLOR_RGB["white"]),
+            alpha,
+        )
+
+    def _refresh_text_color_buttons(self):
+        for code, button in getattr(self, "text_color_buttons", {}).items():
+            layer = button.layer()
+            if layer is None:
+                continue
+            selected = code == self.text_color_code
+            layer.setBorderWidth_(2.0 if selected else 1.0)
+            border = self.NSColor.whiteColor().colorWithAlphaComponent_(0.92 if selected else 0.28)
+            layer.setBorderColor_(border.CGColor())
+
+    def _make_line(self, frame, color):
+        line = self.NSView.alloc().initWithFrame_(frame)
+        line.setWantsLayer_(True)
+        line.layer().setBackgroundColor_(color.CGColor())
+        return line
+
+    def _make_popup(self, popup_cls, frame, items, selected_code, action):
+        popup = popup_cls.alloc().initWithFrame_pullsDown_(frame, False)
+        selected_label = None
+        for code, label in items:
+            popup.addItemWithTitle_(label)
+            popup.itemWithTitle_(label).setRepresentedObject_(code)
+            if code == selected_code:
+                selected_label = label
+        if selected_label is None:
+            selected_label = language_label(selected_code)
+        popup.selectItemWithTitle_(selected_label)
+        popup.setTarget_(self.menu_target)
+        popup.setAction_(action)
+        return popup
+
+    def _make_text_view(self, text_view_cls, scroll):
+        view = text_view_cls.alloc().initWithFrame_(scroll.contentView().bounds())
+        view.setAutoresizingMask_(self.NSViewWidthSizable | self.NSViewHeightSizable)
+        view.setEditable_(False)
+        view.setSelectable_(True)
+        view.setDrawsBackground_(False)
+        view.setTextColor_(self._text_color())
+        view.setFont_(self.NSFont.systemFontOfSize_weight_(20, 0.22))
+        # Padding so text doesn't butt against the divider / window edge.
+        view.setTextContainerInset_(self.NSMakeSize(10, 6))
+        return view
+
+    def _selected_code(self, popup):
+        item = popup.selectedItem()
+        code = item.representedObject() if item else None
+        return str(code) if code else "auto"
+
+    def _new_current_session(self):
+        source_code, target_code = self.settings.get()
+        whisper_code = self.settings.get_whisper_size()
+        gemma_code = self.settings.get_ollama_model()
+        return new_session(
+            source_language=source_code,
+            target_language=target_code,
+            whisper_model=whisper_code,
+            gemma_model=gemma_code,
+            source_label=language_label(source_code),
+            target_label=language_label(target_code),
+            whisper_label=WHISPER_LABELS.get(whisper_code, whisper_code),
+            gemma_label=GEMMA_MODELS.get(gemma_code, gemma_code),
+        )
+
+    def _sync_session_metadata(self):
+        source_code, target_code = self.settings.get()
+        self.current_session["source_language"] = source_code
+        self.current_session["target_language"] = target_code
+        self.current_session["whisper_model"] = self.settings.get_whisper_size()
+        self.current_session["gemma_model"] = self.settings.get_ollama_model()
+
+    def _persist_current_session(self):
+        if not self.current_session.get("phrases"):
+            return
+        self._sync_session_metadata()
+        try:
+            self.current_session = self.session_store.save(self.current_session)
+        except Exception as exc:
+            print(f"[session] failed to save session: {exc}", file=sys.stderr)
+
+    def _session_from_history_pairs(self):
+        session = dict(self.current_session)
+        phrases = []
+        for pair in self.history_pairs:
+            source = str(pair.get("source") or "").strip()
+            translated = str(pair.get("translated") or "").strip()
+            if not source and not translated:
+                continue
+            start = pair.get("start")
+            end = pair.get("end")
+            if start is None:
+                start = pair.get("elapsed")
+            phrases.append(
+                {
+                    "start": round(max(0.0, float(start or 0.0)), 3),
+                    "end": round(max(float(start or 0.0) + 0.001, float(end or 0.0)), 3)
+                    if end is not None
+                    else round(max(0.001, float(start or 0.0) + 2.0), 3),
+                    "source": source,
+                    "translated": translated,
+                    "language": str(pair.get("source_language") or "").strip(),
+                }
+            )
+        session["phrases"] = phrases
+        return session
+
+    def _history_pairs_from_session(self, session):
+        pairs = []
+        started = self.session_started_at
+        for phrase in session.get("phrases") or []:
+            source = str(phrase.get("source") or "").strip()
+            translated = str(phrase.get("translated") or "").strip()
+            if not source and not translated:
+                continue
+            start = max(0.0, float(phrase.get("start") or 0.0))
+            end = max(start + 0.001, float(phrase.get("end") or start + 2.0))
+            pair = {
+                "source": source,
+                "translated": translated,
+                "time": started + end,
+                "elapsed": end,
+                "start": start,
+                "end": end,
+            }
+            language = str(phrase.get("language") or "").strip()
+            if language:
+                pair["source_language"] = language
+            if phrase.get("confidence") is not None:
+                pair["confidence"] = float(phrase.get("confidence"))
+            pairs.append(pair)
+        return pairs
+
+    def _load_session_into_overlay(self, session):
+        self._persist_current_session()
+        self.current_session = dict(session)
+        duration = float(self.current_session.get("duration_seconds") or 0.0)
+        self.session_time_offset_seconds = duration
+        source_code = str(self.current_session.get("source_language") or "auto")
+        target_code = str(self.current_session.get("target_language") or self.settings.get()[1])
+        whisper_code = str(self.current_session.get("whisper_model") or self.settings.get_whisper_size())
+        gemma_code = str(self.current_session.get("gemma_model") or self.settings.get_ollama_model())
+        if source_code in dict(LANG_MENU):
+            self.settings.set_source(source_code)
+            self.source_popup.selectItemWithTitle_(language_label(source_code))
+        if target_code in dict(LANG_MENU) and target_code != "auto":
+            self.settings.set_target(target_code)
+            self.target_popup.selectItemWithTitle_(language_label(target_code))
+        if whisper_code in WHISPER_MODELS:
+            self.settings.set_whisper_size(whisper_code)
+            self.whisper_popup.selectItemWithTitle_(WHISPER_LABELS.get(whisper_code, whisper_code))
+        if gemma_code in GEMMA_MODELS:
+            self.settings.set_ollama_model(gemma_code)
+            self.ollama_model_popup.selectItemWithTitle_(GEMMA_MODELS.get(gemma_code, gemma_code))
+        self.history_pairs = self._history_pairs_from_session(self.current_session)
+        self.original_blocks = []
+        self.translation_blocks = []
+        self.partial_text = ""
+        self.partial_translation = ""
+        now = time.monotonic()
+        self.session_started_at = now - duration
+        for pair in self.history_pairs[-16:]:
+            gap = bool(self.original_blocks)
+            self.original_blocks.append(
+                {"text": pair.get("source") or "", "time": now, "gap": gap}
+            )
+            self.translation_blocks.append(
+                {
+                    "text": pair.get("translated") or "",
+                    "source": pair.get("source") or "",
+                    "time": now,
+                    "gap": gap,
+                }
+            )
+        self.original_blocks = [b for b in self.original_blocks if str(b.get("text") or "").strip()][-16:]
+        self.translation_blocks = [
+            b for b in self.translation_blocks if str(b.get("text") or "").strip()
+        ][-16:]
+        reset_gen = getattr(self, "reset_gen", None)
+        if reset_gen is not None:
+            reset_gen[0] += 1
+        self._render_original()
+        self._render_translation()
+
+    def _source_changed(self, sender):
+        self.settings.set_source(self._selected_code(sender))
+        self._sync_session_metadata()
+
+    def _waiting_translation(self):
+        try:
+            code = self.settings.get()[1]
+        except Exception:
+            code = "en"
+        return WAITING_TRANSLATION.get(code, WAITING_TRANSLATION["en"])
+
+    def _target_changed(self, sender):
+        code = self._selected_code(sender)
+        if code != "auto":
+            self.settings.set_target(code)
+            self._sync_session_metadata()
+        self._render_translation()  # refresh placeholder language if empty
+
+    def _settings_toggled(self, sender):
+        self.settings_visible = not self.settings_visible
+        if self.settings_visible:
+            self.save_visible = False
+            self.text_color_visible = False
+            self.history_visible = False
+            self.save_panel.setHidden_(True)
+            self.text_color_panel.setHidden_(True)
+            self.history_panel.setHidden_(True)
+        self.settings_panel.setHidden_(not self.settings_visible)
+        self._relayout()
+
+    def _save_toggled(self, sender=None):
+        self.save_visible = not self.save_visible
+        if self.save_visible:
+            self.settings_visible = False
+            self.history_visible = False
+            self.text_color_visible = False
+            self.settings_panel.setHidden_(True)
+            self.history_panel.setHidden_(True)
+            self.text_color_panel.setHidden_(True)
+        self.save_panel.setHidden_(not self.save_visible)
+        self._relayout()
+
+    def _save_format_button(self, sender=None):
+        tag = sender.tag() if sender is not None else -1
+        codes = [code for code, _ in SAVE_FORMAT_MENU]
+        code = codes[tag] if 0 <= tag < len(codes) else None
+        if code == "txt":
+            self._save_txt(sender)
+        elif code == "pdf":
+            self._save_pdf(sender)
+        elif code in {"srt", "vtt"}:
+            self._save_subtitle(sender, code)
+
+    def _save_selected_format(self, sender=None):
+        pass
+
+    def _settings_models_tab(self, sender=None):
+        self._settings_toggled(sender)
+
+    def _settings_history_tab(self, sender=None):
+        self._history_toggled(sender)
+
+    def _refresh_settings_tab_visibility(self):
+        for control in getattr(self, "settings_model_controls", []):
+            control.setHidden_(False)
+
+    def _text_color_toggled(self, sender):
+        self.text_color_visible = not self.text_color_visible
+        if self.text_color_visible:
+            self.save_visible = False
+            self.settings_visible = False
+            self.history_visible = False
+            self.save_panel.setHidden_(True)
+            self.settings_panel.setHidden_(True)
+            self.history_panel.setHidden_(True)
+        self.text_color_panel.setHidden_(not self.text_color_visible)
+        self._relayout()
+
+    def _text_color_changed(self, sender):
+        idx = int(sender.tag())
+        if idx < 0 or idx >= len(TEXT_COLOR_OPTIONS):
+            return
+        code = TEXT_COLOR_OPTIONS[idx][0]
+        if code not in TEXT_COLOR_RGB:
+            return
+        self.text_color_code = code
+        self.original_view.setTextColor_(self._text_color())
+        self.translated_view.setTextColor_(self._text_color())
+        self._refresh_text_color_buttons()
+        self._render_original()
+        self._render_translation()
+
+    def _whisper_changed(self, sender):
+        code = self._selected_code(sender)
+        if code in WHISPER_MODELS:
+            self.settings.set_whisper_size(code)
+            self._sync_session_metadata()
+
+    def _ollama_model_changed(self, sender):
+        code = self._selected_code(sender)
+        if code not in GEMMA_MODELS:
+            return
+        self.settings.set_ollama_model(code)
+        self._sync_session_metadata()
+
+    def _compact_changed(self, sender):
+        self.compact_mode = not self.compact_mode
+        self.left_scroll.setHidden_(self.compact_mode)
+        self.original_label.setHidden_(self.compact_mode)
+        self.divider_shadow.setHidden_(self.compact_mode)
+        self.divider_highlight.setHidden_(self.compact_mode)
+        if self.compact_mode:
+            self.right_scroll.setFrame_(self.compact_frames["right_scroll"])
+            self.translation_label.setFrame_(self.compact_frames["translation_label"])
+            self.compact_button.setTitle_("Expanded")
+        else:
+            self.right_scroll.setFrame_(self.expanded_frames["right_scroll"])
+            self.translation_label.setFrame_(self.expanded_frames["translation_label"])
+            self.compact_button.setTitle_("Compact")
+        self.translated_view.setFrame_(self.right_scroll.contentView().bounds())
+        self._render_translation()
+
+    def _pin_changed(self, sender):
+        self.pin_enabled = sender.state() == self.NSOnState
+        self.window.setLevel_(self.NSFloatingWindowLevel if self.pin_enabled else self.NSNormalWindowLevel)
+
+    def _adjust_text_size(self, delta):
+        self.font_size = max(14, min(32, self.font_size + delta))
+        self._render_original()
+        self._render_translation()
+
+    def _clear_all(self, sender=None):
+        self._persist_current_session()
+        self.original_blocks = []
+        self.translation_blocks = []
+        self.history_pairs = []
+        self.current_session = self._new_current_session()
+        self.session_time_offset_seconds = 0.0
+        self.session_started_at = time.monotonic()
+        self.partial_text = ""
+        self.partial_translation = ""
+        # Also wipe both workers' rolling state (audio buffer, tail, sentence buffer,
+        # Whisper context) and pending queues so it restarts from a clean slate.
+        reset_gen = getattr(self, "reset_gen", None)
+        if reset_gen is not None:
+            reset_gen[0] += 1
+        self._render_original()
+        self._render_translation()
+
+    def _notify(self, title, message):
+        try:
+            from AppKit import NSAlert
+
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_(str(title))
+            alert.setInformativeText_(str(message))
+            alert.runModal()
+        except Exception:
+            print(f"[{title}] {message}", file=sys.stderr)
+
+    def _txt_section_title(self, code, section):
+        code = (code or "auto").lower()
+        idx = 0 if section == "transcript" else 1
+        return TXT_SECTION_TITLES.get(code, TXT_SECTION_TITLES["ru"])[idx]
+
+    def _txt_transcript_title(self):
+        source_code, _target_code = self.settings.get()
+        if source_code != "auto":
+            return self._txt_section_title(source_code, "transcript")
+        for pair in self.history_pairs:
+            detected = str(pair.get("source_language") or "").lower().strip()
+            if detected and detected != "auto" and detected in TXT_SECTION_TITLES:
+                return self._txt_section_title(detected, "transcript")
+        return self._txt_section_title("auto", "transcript")
+
+    def _save_txt(self, sender=None):
+        import datetime
+
+        from AppKit import NSSavePanel
+
+        self.save_visible = False
+        self.save_panel.setHidden_(True)
+
+        if not self.history_pairs:
+            self._notify("Nothing to save", "No translated text yet.")
+            return
+
+        session = self._session_from_history_pairs()
+        if not session.get("phrases"):
+            self._notify("Nothing to save", "No text for TXT yet.")
+            return
+
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        panel = NSSavePanel.savePanel()
+        panel.setNameFieldStringValue_(f"LiveTranslate-{ts}.txt")
+        try:
+            panel.setAllowedFileTypes_(["txt"])
+        except Exception:
+            pass
+        self.app.activateIgnoringOtherApps_(True)
+        if panel.runModal() != 1:  # 1 == NSModalResponseOK
+            return
+        path = panel.URL().path()
+
+        _source_code, target_code = self.settings.get()
+        content = export_txt(
+            session,
+            transcript_title=self._txt_transcript_title(),
+            translation_title=self._txt_section_title(target_code, "translation"),
+        )
+        ok = False
+        try:
+            Path(path).write_text(content, encoding="utf-8")
+            ok = Path(path).exists() and Path(path).stat().st_size > 0
+        except Exception as exc:
+            print(f"[txt] failed to save TXT: {exc}", file=sys.stderr)
+
+        self._notify(
+            "TXT saved" if ok else "Error",
+            path if ok else "Failed to write file.",
+        )
+
+    def _save_subtitle(self, sender=None, fmt="srt"):
+        import datetime
+
+        from AppKit import NSSavePanel
+
+        self.save_visible = False
+        self.save_panel.setHidden_(True)
+
+        session = self._session_from_history_pairs()
+        if not session.get("phrases"):
+            self._notify("Nothing to save", "No timestamped text yet.")
+            return
+
+        fmt = str(fmt or "srt").lower()
+        ext = "vtt" if fmt == "vtt" else "srt"
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        panel = NSSavePanel.savePanel()
+        panel.setNameFieldStringValue_(f"LiveTranslate-{ts}.{ext}")
+        try:
+            panel.setAllowedFileTypes_([ext])
+        except Exception:
+            pass
+        self.app.activateIgnoringOtherApps_(True)
+        if panel.runModal() != 1:
+            return
+
+        base = Path(panel.URL().path()).with_suffix("")
+        original_path = base.parent / f"{base.name}.original.{ext}"
+        translation_path = base.parent / f"{base.name}.translation.{ext}"
+        ok = False
+        try:
+            original_path.write_text(
+                export_subtitles(session, field="source", fmt=fmt),
+                encoding="utf-8",
+            )
+            translation_path.write_text(
+                export_subtitles(session, field="translated", fmt=fmt),
+                encoding="utf-8",
+            )
+            ok = original_path.exists() and translation_path.exists()
+        except Exception as exc:
+            print(f"[{ext}] failed to save subtitles: {exc}", file=sys.stderr)
+
+        self._notify(
+            f"{ext.upper()} saved" if ok else "Error",
+            f"{original_path}\n{translation_path}" if ok else "Failed to write files.",
+        )
+
+    def _history_toggled(self, sender=None):
+        self._persist_current_session()
+        self.history_visible = not self.history_visible
+        if self.history_visible:
+            self.save_visible = False
+            self.settings_visible = False
+            self.text_color_visible = False
+            self.save_panel.setHidden_(True)
+            self.settings_panel.setHidden_(True)
+            self.text_color_panel.setHidden_(True)
+            self._refresh_history_window()
+        self.history_panel.setHidden_(not self.history_visible)
+        self._relayout()
+
+    def _history_summary(self, session):
+        labels = dict(LANG_MENU)
+        return session.get("title") or session_summary(
+            session,
+            source_labels=labels,
+            target_labels=labels,
+            whisper_labels=WHISPER_LABELS,
+            gemma_labels=GEMMA_MODELS,
+        )
+
+    def _make_history_label(self, text_field_cls, value, frame, size=12, alpha=0.72):
+        label = text_field_cls.alloc().initWithFrame_(frame)
+        label.setStringValue_(value)
+        label.setBezeled_(False)
+        label.setDrawsBackground_(False)
+        label.setEditable_(False)
+        label.setSelectable_(False)
+        label.setTextColor_(self.NSColor.blackColor().colorWithAlphaComponent_(alpha))
+        label.setFont_(self.NSFont.systemFontOfSize_weight_(size, 0.18))
+        return label
+
+    def _show_history_window(self):
+        self._history_toggled(None)
+        self._refresh_history_window()
+
+    def _refresh_history_window(self):
+        if getattr(self, "history_popup", None) is None:
+            return
+        self.history_sessions = self.session_store.list()
+        self.history_popup.removeAllItems()
+        if not self.history_sessions:
+            self.history_popup.addItemWithTitle_("No saved sessions")
+            if self.history_detail_label is not None:
+                self.history_detail_label.setStringValue_(str(self.session_store.root))
+            for button in getattr(self, "history_action_buttons", []):
+                button.setEnabled_(False)
+            return
+
+        for idx, session in enumerate(self.history_sessions):
+            label = self._history_summary(session)
+            if len(label) > 96:
+                label = label[:93].rstrip() + "..."
+            self.history_popup.addItemWithTitle_(label)
+            item = self.history_popup.itemAtIndex_(idx)
+            if item is not None:
+                item.setRepresentedObject_(session.get("id"))
+        for button in getattr(self, "history_action_buttons", []):
+            button.setEnabled_(True)
+        self._history_changed(None)
+
+    def _selected_history_session_id(self):
+        popup = getattr(self, "history_popup", None)
+        if popup is None:
+            return None
+        item = popup.selectedItem()
+        session_id = item.representedObject() if item is not None else None
+        return str(session_id) if session_id else None
+
+    def _selected_history_session(self):
+        session_id = self._selected_history_session_id()
+        if not session_id:
+            return None
+        for session in getattr(self, "history_sessions", []):
+            if session.get("id") == session_id:
+                return session
+        try:
+            return self.session_store.load(session_id)
+        except Exception as exc:
+            print(f"[session] failed to load session: {exc}", file=sys.stderr)
+            return None
+
+    def _history_changed(self, sender=None):
+        session = self._selected_history_session()
+        if session is None or getattr(self, "history_detail_label", None) is None:
+            return
+        count = len(session.get("phrases") or [])
+        duration = int(round(float(session.get("duration_seconds") or 0.0)))
+        minutes, seconds = divmod(duration, 60)
+        detail = (
+            f"{count} phrases, {minutes:02d}:{seconds:02d}, "
+            f"{session.get('source_language') or 'auto'} -> {session.get('target_language') or ''}, "
+            f"{session.get('whisper_model') or ''} / {session.get('gemma_model') or ''}"
+        )
+        if self.history_detail_label is not None:
+            self.history_detail_label.setStringValue_(detail)
+
+    def _history_open(self, sender=None):
+        session = self._selected_history_session()
+        if session is None:
+            return
+        self._load_session_into_overlay(session)
+        self.post_status_text("session opened", alpha=0.72)
+
+    def _history_continue(self, sender=None):
+        self._history_open(sender)
+
+    def _history_rename(self, sender=None):
+        session = self._selected_history_session()
+        if session is None:
+            return
+        try:
+            from AppKit import NSAlert, NSTextField
+
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Rename Session")
+            alert.addButtonWithTitle_("Rename")
+            alert.addButtonWithTitle_("Cancel")
+            field = NSTextField.alloc().initWithFrame_(((0, 0), (420, 24)))
+            field.setStringValue_(session.get("title") or self._history_summary(session))
+            alert.setAccessoryView_(field)
+            if alert.runModal() != 1000:
+                return
+            title = str(field.stringValue() or "").strip()
+            if not title:
+                return
+            updated = self.session_store.rename(session["id"], title)
+            if self.current_session.get("id") == updated.get("id"):
+                self.current_session["title"] = updated.get("title")
+            self._refresh_history_window()
+        except Exception as exc:
+            print(f"[session] failed to rename: {exc}", file=sys.stderr)
+            self._notify("Error", "Failed to rename session.")
+
+    def _history_delete(self, sender=None):
+        session = self._selected_history_session()
+        if session is None:
+            return
+        try:
+            from AppKit import NSAlert
+
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Delete Session")
+            alert.setInformativeText_(self._history_summary(session))
+            alert.addButtonWithTitle_("Delete")
+            alert.addButtonWithTitle_("Cancel")
+            if alert.runModal() != 1000:
+                return
+            self.session_store.delete(session["id"])
+            if self.current_session.get("id") == session.get("id"):
+                self.original_blocks = []
+                self.translation_blocks = []
+                self.history_pairs = []
+                self.partial_text = ""
+                self.partial_translation = ""
+                self.current_session = self._new_current_session()
+                self.session_time_offset_seconds = 0.0
+                self.session_started_at = time.monotonic()
+                reset_gen = getattr(self, "reset_gen", None)
+                if reset_gen is not None:
+                    reset_gen[0] += 1
+                self._render_original()
+                self._render_translation()
+            self._refresh_history_window()
+        except Exception as exc:
+            print(f"[session] failed to delete: {exc}", file=sys.stderr)
+            self._notify("Error", "Failed to delete session.")
+
+    def _save_pdf(self, sender=None):
+        import datetime
+        import os
+        import re
+
+        from AppKit import NSSavePanel
+
+        self.save_visible = False
+        self.save_panel.setHidden_(True)
+
+        if not self.history_pairs:
+            self._notify("Nothing to save", "No translated text yet.")
+            return
+
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        panel = NSSavePanel.savePanel()
+        panel.setNameFieldStringValue_(f"LiveTranslate-{ts}.pdf")
+        try:
+            panel.setAllowedFileTypes_(["pdf"])
+        except Exception:
+            pass
+        self.app.activateIgnoringOtherApps_(True)
+        if panel.runModal() != 1:  # 1 == NSModalResponseOK
+            return
+        path = panel.URL().path()
+
+        from AppKit import (
+            NSGradient,
+            NSGraphicsContext,
+            NSKernAttributeName,
+            NSMutableParagraphStyle,
+            NSParagraphStyleAttributeName,
+        )
+        from Foundation import NSURL
+        from Quartz import (
+            CGPDFContextBeginPage,
+            CGPDFContextClose,
+            CGPDFContextCreateWithURL,
+            CGPDFContextEndPage,
+            CGRectMake,
+        )
+
+        NSColor = self.NSColor
+        NSFont = self.NSFont
+        NSFontAttr = self.NSFontAttributeName
+        NSFgAttr = self.NSForegroundColorAttributeName
+
+        page_width = 595.28
+        page_height = 841.89
+        outer = 30.0
+        card_gap = 8.0
+        pad_x, pad_top, pad_bottom = 16.0, 10.0, 12.0
+        footer_h = 24.0
+        inner_w = page_width - outer * 2 - pad_x * 2
+
+        c_title = NSColor.colorWithCalibratedWhite_alpha_(0.13, 1.0)
+        c_subtitle = NSColor.colorWithCalibratedWhite_alpha_(0.45, 1.0)
+        c_label = NSColor.colorWithCalibratedWhite_alpha_(0.50, 1.0)
+        c_src = NSColor.colorWithCalibratedWhite_alpha_(0.32, 1.0)
+        c_tr = NSColor.colorWithCalibratedWhite_alpha_(0.13, 1.0)
+        c_accent = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.20, 0.36, 0.92, 1.0)
+
+        gradient = NSGradient.alloc().initWithColors_(
+            [
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.88, 0.92, 0.99, 1.0),
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.93, 0.91, 0.99, 1.0),
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.99, 0.94, 0.96, 1.0),
+            ]
+        )
+
+        title_font = NSFont.systemFontOfSize_weight_(20.0, 0.32)
+        subtitle_font = NSFont.systemFontOfSize_(9.5)
+        label_font = NSFont.systemFontOfSize_weight_(7.8, 0.34)
+        body_font = NSFont.systemFontOfSize_(10.4)
+        footer_font = NSFont.systemFontOfSize_(7.8)
+        try:
+            time_font = NSFont.monospacedDigitSystemFontOfSize_weight_(8.2, 0.34)
+        except Exception:
+            time_font = label_font
+
+        def para(line_spacing=0.0, after=0.0, before=0.0):
+            p = NSMutableParagraphStyle.alloc().init()
+            p.setLineSpacing_(line_spacing)
+            p.setParagraphSpacing_(after)
+            p.setParagraphSpacingBefore_(before)
+            return p
+
+        ps_body = para(line_spacing=1.6)
+        ps_label_before = para(after=2.0, before=8.0)
+        ps_time = para(after=3.0)
+        ps_footer = para(line_spacing=1.2)
+        ps_title = para(after=2.0)
+
+        def piece(text, font, color, ps, kern=None):
+            attrs = {NSFgAttr: color, NSFontAttr: font, NSParagraphStyleAttributeName: ps}
+            if kern is not None:
+                attrs[NSKernAttributeName] = kern
+            return self.NSMutableAttributedString.alloc().initWithString_attributes_(text, attrs)
+
+        from AppKit import NSTextView
+
+        # TextKit measurement matches final NSTextView rendering and avoids clipped last lines.
+        def make_tv(attr, width):
+            tv = NSTextView.alloc().initWithFrame_(((0, 0), (width, 1.0e6)))
+            tv.setDrawsBackground_(False)
+            tv.setEditable_(False)
+            tv.setSelectable_(False)
+            tv.textContainer().setLineFragmentPadding_(0.0)
+            tv.setTextContainerInset_((0.0, 0.0))
+            tv.textStorage().setAttributedString_(attr)
+            lm, tc = tv.layoutManager(), tv.textContainer()
+            lm.ensureLayoutForTextContainer_(tc)
+            h = float(lm.usedRectForTextContainer_(tc).size.height)
+            return tv, h
+
+        def format_timecode(pair):
+            elapsed = pair.get("elapsed")
+            if elapsed is None:
+                absolute = pair.get("time")
+                if isinstance(absolute, int | float):
+                    elapsed = absolute - getattr(self, "session_started_at", absolute)
+            if elapsed is None:
+                return "--:--:--"
+            total = max(0, int(round(float(elapsed))))
+            hours, rem = divmod(total, 3600)
+            minutes, seconds = divmod(rem, 60)
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+        human = datetime.datetime.now().strftime("%d %B %Y - %H:%M")
+        header = self.NSMutableAttributedString.alloc().init()
+        header.appendAttributedString_(piece("Live Translation\n", title_font, c_title, ps_title))
+        header.appendAttributedString_(piece(human, subtitle_font, c_subtitle, para()))
+        header_w = page_width - outer * 2
+        _, header_h = make_tv(header, header_w)
+        header_gap = 14.0
+        content_bottom = page_height - outer - footer_h
+        first_page_max_card_h = content_bottom - (outer + header_h + header_gap)
+        max_card_h = max(120.0, first_page_max_card_h)
+
+        def make_card(src, tr, timecode, continued=False):
+            src = (src or "").strip()
+            tr = (tr or "").strip()
+            first_label = "ORIGINAL" if src else "TRANSLATION"
+            first_label_color = c_label if src else c_accent
+            suffix = " CONT." if continued else ""
+            content = self.NSMutableAttributedString.alloc().init()
+            content.appendAttributedString_(piece(f"{timecode}  ", time_font, c_label, ps_time, kern=0.2))
+            content.appendAttributedString_(piece(f"{first_label}{suffix}\n", label_font, first_label_color, ps_time, kern=1.2))
+            if src:
+                content.appendAttributedString_(
+                    piece(src + ("\n" if tr else ""), body_font, c_src, ps_body)
+                )
+            if tr:
+                if src:
+                    content.appendAttributedString_(piece("TRANSLATION\n", label_font, c_accent, ps_label_before, kern=1.2))
+                content.appendAttributedString_(piece(tr, body_font, c_tr, ps_body))
+            _, content_h = make_tv(content, inner_w)
+            return {"attr": content, "content_h": content_h, "card_h": pad_top + content_h + pad_bottom}
+
+        def tokens_for(text):
+            tokens = re.findall(r"\S+\s*", text)
+            if tokens:
+                return tokens
+            return [text[i : i + 120] for i in range(0, len(text), 120)]
+
+        def split_single(label, text, timecode):
+            tokens = tokens_for(text.strip())
+            cards = []
+            pos = 0
+            while pos < len(tokens):
+                lo, hi = 1, len(tokens) - pos
+                best = 1
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    chunk = "".join(tokens[pos : pos + mid]).strip()
+                    src = chunk if label == "ORIGINAL" else ""
+                    tr = chunk if label == "TRANSLATION" else ""
+                    card = make_card(src, tr, timecode, continued=bool(cards))
+                    if card["card_h"] <= max_card_h:
+                        best = mid
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                chunk = "".join(tokens[pos : pos + best]).strip()
+                src = chunk if label == "ORIGINAL" else ""
+                tr = chunk if label == "TRANSLATION" else ""
+                cards.append(make_card(src, tr, timecode, continued=bool(cards)))
+                pos += best
+            return cards
+
+        cards = []
+        for pair in self.history_pairs:
+            src = (pair.get("source") or "").strip()
+            tr = (pair.get("translated") or "").strip()
+            if not src and not tr:
+                continue
+            timecode = format_timecode(pair)
+            card = make_card(src, tr, timecode)
+            if card["card_h"] <= max_card_h:
+                cards.append(card)
+            else:
+                if src:
+                    cards.extend(split_single("ORIGINAL", src, timecode))
+                if tr:
+                    cards.extend(split_single("TRANSLATION", tr, timecode))
+
+        if not cards:
+            self._notify("Nothing to save", "No translated text yet.")
+            return
+
+        pages = []
+        current = []
+        include_header = True
+        y = outer + header_h + header_gap
+        for card in cards:
+            gap = card_gap if current else 0.0
+            if current and y + gap + card["card_h"] > content_bottom:
+                pages.append((include_header, current))
+                current = []
+                include_header = False
+                y = outer
+                gap = 0.0
+            current.append(card)
+            y += gap + card["card_h"]
+        if current:
+            pages.append((include_header, current))
+
+        ViewClass = _glass_pdf_view_class()
+
+        def add_text_view(view, attr, x, y_pos, width):
+            tv, tv_h = make_tv(attr, width)
+            tv.setFrame_(((x, y_pos), (width, tv_h)))
+            view.addSubview_(tv)
+            return tv_h
+
+        def make_page_view(page_index, total_pages, has_header, page_cards):
+            view = ViewClass.alloc().initWithFrame_(((0, 0), (page_width, page_height)))
+            view._gradient = gradient
+            view._texts = []
+            view._cards = []
+            view._card_radius = 12.0
+            view._shadow_blur = 8.0
+
+            y_pos = outer
+            if has_header:
+                add_text_view(view, header, outer, y_pos, header_w)
+                y_pos += header_h + header_gap
+
+            for idx, card in enumerate(page_cards):
+                if idx:
+                    y_pos += card_gap
+                view._cards.append(((outer, y_pos), (page_width - outer * 2, card["card_h"])))
+                tv, _ = make_tv(card["attr"], inner_w)
+                tv.setFrame_(((outer + pad_x, y_pos + pad_top), (inner_w, card["content_h"])))
+                view.addSubview_(tv)
+                y_pos += card["card_h"]
+
+            footer = self.NSMutableAttributedString.alloc().init()
+            footer_text = f"Live Translation - {page_index + 1}/{total_pages}"
+            if page_index == 0:
+                footer_text += (
+                    "\nTimecode is measured from app launch; launch time is treated as 00:00:00."
+                )
+            footer.appendAttributedString_(
+                piece(footer_text, footer_font, c_subtitle, ps_footer)
+            )
+            add_text_view(view, footer, outer, page_height - outer - footer_h, header_w)
+            return view
+
+        media_box = CGRectMake(0.0, 0.0, page_width, page_height)
+        ctx = CGPDFContextCreateWithURL(NSURL.fileURLWithPath_(path), media_box, None)
+        ok = bool(ctx)
+        if ok:
+            total_pages = len(pages)
+            for page_index, (has_header, page_cards) in enumerate(pages):
+                page_view = make_page_view(page_index, total_pages, has_header, page_cards)
+                CGPDFContextBeginPage(ctx, {})
+                graphics = NSGraphicsContext.graphicsContextWithCGContext_flipped_(ctx, False)
+                NSGraphicsContext.saveGraphicsState()
+                NSGraphicsContext.setCurrentContext_(graphics)
+                page_view.displayRectIgnoringOpacity_inContext_(page_view.bounds(), graphics)
+                NSGraphicsContext.restoreGraphicsState()
+                CGPDFContextEndPage(ctx)
+            CGPDFContextClose(ctx)
+            ok = os.path.exists(path) and os.path.getsize(path) > 0
+        self._notify(
+            "PDF saved" if ok else "Error",
+            path if ok else "Failed to write file.",
+        )
+
+    def post_pair(
+        self,
+        source,
+        translated,
+        pause_ms=0,
+        replace_translation_tail=False,
+        combined_source=None,
+        append_source=True,
+        source_language=None,
+        start_seconds=None,
+        end_seconds=None,
+        confidence=None,
+    ):
+        self.AppHelper.callAfter(
+            self._append_pair,
+            source,
+            translated,
+            pause_ms,
+            replace_translation_tail,
+            combined_source,
+            append_source,
+            source_language,
+            start_seconds,
+            end_seconds,
+            confidence,
+        )
+
+    def post_partial(self, source):
+        if not self.show_partial:
+            return
+        self.AppHelper.callAfter(self._set_partial, source)
+
+    def post_partial_translation(self, translated):
+        # The streaming translation is the real (about-to-be-committed) text arriving live,
+        # not a speculative draft — show it regardless of show_partial.
+        self.AppHelper.callAfter(self._set_partial_translation, translated)
+
+    def post_source(self, source, pause_ms=0):
+        self.AppHelper.callAfter(self._append_source, source, pause_ms)
+
+    def post_status(self, lag_chunks):
+        lag_chunks = int(lag_chunks)
+        now = time.monotonic()
+        if (
+            lag_chunks != 0
+            and now - self._last_status_posted_at < STATUS_UPDATE_INTERVAL_SECONDS
+        ):
+            return
+        if lag_chunks == self._last_status_value and now - self._last_status_posted_at < 1.0:
+            return
+        self._last_status_posted_at = now
+        self._last_status_value = lag_chunks
+        self._last_status_text = f"lag:{lag_chunks}"
+        self.AppHelper.callAfter(self._set_status, lag_chunks)
+
+    def _set_status(self, lag_chunks):
+        self.status_label.setStringValue_(f"lag: {lag_chunks} chunks")
+        alpha = 0.9 if lag_chunks else 0.62
+        self.status_label.setTextColor_(self.NSColor.whiteColor().colorWithAlphaComponent_(alpha))
+
+    def post_status_text(self, text, alpha=0.72):
+        text = str(text or "").strip()
+        if not text:
+            return
+        now = time.monotonic()
+        if text == self._last_status_text and now - self._last_status_posted_at < 1.0:
+            return
+        self._last_status_posted_at = now
+        self._last_status_text = text
+        self.AppHelper.callAfter(self._set_status_text, text, float(alpha))
+
+    def _set_status_text(self, text, alpha=0.72):
+        self.status_label.setStringValue_(str(text))
+        self.status_label.setTextColor_(
+            self.NSColor.whiteColor().colorWithAlphaComponent_(float(alpha))
+        )
+
+    def _append_pair(
+        self,
+        source,
+        translated,
+        pause_ms=0,
+        replace_translation_tail=False,
+        combined_source=None,
+        append_source=True,
+        source_language=None,
+        start_seconds=None,
+        end_seconds=None,
+        confidence=None,
+    ):
+        # Guard the main-thread render path: an exception here can stop the run loop from
+        # delivering further UI updates, freezing the display while workers keep running.
+        try:
+            now = time.monotonic()
+            speaker_gap = pause_ms >= 1400
+            source_language = str(source_language or "").strip()
+            elapsed_now = now - self.session_started_at
+            time_offset = float(getattr(self, "session_time_offset_seconds", 0.0) or 0.0)
+            phrase_start = (
+                elapsed_now
+                if start_seconds is None
+                else time_offset + max(0.0, float(start_seconds))
+            )
+            phrase_end = end_seconds
+            if phrase_end is None:
+                phrase_end = max(phrase_start + 0.001, elapsed_now)
+            else:
+                phrase_end = time_offset + max(0.0, float(phrase_end))
+            phrase_end = max(phrase_start + 0.001, float(phrase_end))
+            if source and not str(translated).startswith("Error:"):
+                if replace_translation_tail and self.history_pairs:
+                    previous = self.history_pairs[-1]
+                    previous["source"] = str(combined_source or "").strip() or (
+                        f"{str(previous.get('source') or '').rstrip()} {source}".strip()
+                    )
+                    previous["translated"] = translated or ""
+                    previous["start"] = min(float(previous.get("start") or phrase_start), phrase_start)
+                    previous["end"] = max(float(previous.get("end") or phrase_end), phrase_end)
+                    if source_language:
+                        previous["source_language"] = source_language
+                    previous["time"] = now
+                    previous["elapsed"] = elapsed_now
+                    if confidence is not None:
+                        previous["confidence"] = float(confidence)
+                    phrases = self.current_session.setdefault("phrases", [])
+                    if phrases:
+                        phrases[-1].update(
+                            {
+                                "start": round(float(previous["start"]), 3),
+                                "end": round(float(previous["end"]), 3),
+                                "source": previous["source"],
+                                "translated": previous["translated"],
+                            }
+                        )
+                        if source_language:
+                            phrases[-1]["language"] = source_language
+                else:
+                    pair = {
+                        "source": source,
+                        "translated": translated or "",
+                        "time": now,
+                        "elapsed": elapsed_now,
+                        "start": phrase_start,
+                        "end": phrase_end,
+                    }
+                    if source_language:
+                        pair["source_language"] = source_language
+                    if confidence is not None:
+                        pair["confidence"] = float(confidence)
+                    self.history_pairs.append(pair)
+                    phrase = {
+                        "start": round(phrase_start, 3),
+                        "end": round(phrase_end, 3),
+                        "source": source,
+                        "translated": translated or "",
+                    }
+                    if source_language:
+                        phrase["language"] = source_language
+                    if confidence is not None:
+                        phrase["confidence"] = float(confidence)
+                    self.current_session.setdefault("phrases", []).append(phrase)
+                if len(self.history_pairs) > 5000:
+                    self.history_pairs = self.history_pairs[-5000:]
+                if len(self.current_session.get("phrases") or []) > 5000:
+                    self.current_session["phrases"] = self.current_session["phrases"][-5000:]
+                self._persist_current_session()
+            if append_source:
+                self._append_source(source, pause_ms, now=now)
+            # The streamed live draft (if any) is now superseded by the committed block.
+            had_partial = bool(self.partial_translation)
+            self.partial_translation = ""
+            if translated:
+                if replace_translation_tail:
+                    self._replace_translation_tail(
+                        translated,
+                        now,
+                        bool(speaker_gap),
+                        combined_source or source,
+                    )
+                else:
+                    self._append_translation_block(translated, now, speaker_gap, source)
+                self._render_translation()
+            elif had_partial:
+                self._render_translation()
+        except Exception as exc:
+            print(f"[ui] _append_pair: {exc!r}", file=sys.stderr)
+
+    def _append_source(self, source, pause_ms=0, now=None):
+        source = str(source or "").strip()
+        if not source:
+            return
+        if now is None:
+            now = time.monotonic()
+        speaker_gap = float(pause_ms or 0.0) >= 1400
+        self.original_blocks.append({"text": source, "time": now, "gap": speaker_gap})
+        self.original_blocks = self.original_blocks[-16:]
+        self.partial_text = ""
+        self._render_original()
+
+    def _should_merge_translation_tail(self, previous, incoming, now, speaker_gap, incoming_source=None):
+        previous_text = (previous.get("text") or "").strip()
+        incoming_text = (incoming or "").strip()
+        previous_source = (previous.get("source") or "").strip()
+        incoming_source = (incoming_source or "").strip()
+        if not previous_text or not incoming_text:
+            return False
+        boundary_text = previous_source or previous_text
+        source_aware = bool(previous_source and incoming_source)
+        if (
+            not source_aware
+            and now - float(previous.get("time") or now) > TRANSLATION_TAIL_REGROUP_SECONDS
+        ):
+            return False
+        max_merged = (
+            TRANSLATION_TAIL_MAX_SOURCE_MERGED_CHARS
+            if source_aware
+            else TRANSLATION_TAIL_MAX_MERGED_CHARS
+        )
+        if len(previous_text) + len(incoming_text) > max_merged:
+            return False
+        if boundary_text.endswith((",", ";", ":", "-", "—")):
+            return True
+        if ELLIPSIS_END_RE.search(boundary_text):
+            return True
+        if SOFT_END_RE.search(boundary_text):
+            return source_aware and starts_like_continuation(incoming_source)
+        if speaker_gap and not source_aware:
+            return False
+        return source_aware
+
+    def _append_translation_block(self, translated, now, speaker_gap, source=None):
+        text = str(translated).strip()
+        if not text:
+            return
+        source_text = str(source or "").strip()
+        if self.translation_blocks and self._should_merge_translation_tail(
+            self.translation_blocks[-1],
+            text,
+            now,
+            speaker_gap,
+            source_text,
+        ):
+            previous = self.translation_blocks[-1]
+            previous["text"] = f"{str(previous.get('text') or '').rstrip()} {text}".strip()
+            if source_text:
+                previous["source"] = f"{str(previous.get('source') or '').rstrip()} {source_text}".strip()
+            previous["time"] = now
+            previous["gap"] = bool(previous.get("gap")) or speaker_gap
+        else:
+            self.translation_blocks.append(
+                {"text": text, "source": source_text, "time": now, "gap": speaker_gap}
+            )
+        self.translation_blocks = self.translation_blocks[-16:]
+
+    def _replace_translation_tail(self, translated, now, speaker_gap, source=None):
+        text = str(translated).strip()
+        if not text:
+            return
+        source_text = str(source or "").strip()
+        if not self.translation_blocks:
+            self.translation_blocks.append(
+                {"text": text, "source": source_text, "time": now, "gap": speaker_gap}
+            )
+            return
+        previous = self.translation_blocks[-1]
+        previous["text"] = text
+        previous["source"] = source_text
+        previous["time"] = now
+        previous["gap"] = bool(previous.get("gap"))
+
+    def _set_partial(self, source):
+        try:
+            self.partial_text = source.strip()
+            self._render_original()
+        except Exception as exc:
+            print(f"[ui] _set_partial: {exc!r}", file=sys.stderr)
+
+    def _set_partial_translation(self, translated):
+        try:
+            self.partial_translation = str(translated or "").strip()
+            self._render_translation()
+        except Exception as exc:
+            print(f"[ui] _set_partial_translation: {exc!r}", file=sys.stderr)
+
+    def _render_original(self):
+        full_text, spans = self._compose_blocks(self.original_blocks)
+        partial = self.partial_text.strip()
+        if partial:
+            if full_text and not full_text.endswith("\n\n"):
+                full_text += "\n\n"
+            full_text += partial
+
+        if not full_text:
+            full_text = WAITING_ORIGINAL
+
+        font = self.NSFont.systemFontOfSize_weight_(self.font_size, 0.22)
+        committed_attrs = {
+            self.NSForegroundColorAttributeName: self._text_color(),
+            self.NSFontAttributeName: font,
+        }
+        attributed = self.NSMutableAttributedString.alloc().initWithString_attributes_(
+            full_text,
+            committed_attrs,
+        )
+        self._apply_block_fade(attributed, spans, font)
+        if partial:
+            partial_start = len(full_text) - len(partial)
+            partial_attrs = {
+                self.NSForegroundColorAttributeName: self._text_color(0.32),
+                self.NSFontAttributeName: font,
+            }
+            attributed.addAttributes_range_(
+                partial_attrs,
+                self.NSMakeRange(partial_start, len(partial)),
+            )
+        self.original_view.textStorage().setAttributedString_(attributed)
+        self.original_view.scrollRangeToVisible_(self.NSMakeRange(len(full_text), 0))
+
+    def _render_translation(self):
+        full_text, spans = self._compose_blocks(self.translation_blocks)
+        partial = self.partial_translation.strip()
+        if partial:
+            if full_text and not full_text.endswith("\n\n"):
+                full_text += "\n\n"
+            full_text += partial
+        if not full_text:
+            full_text = self._waiting_translation()
+        font = self.NSFont.systemFontOfSize_weight_(self.font_size, 0.22)
+        attrs = {
+            self.NSForegroundColorAttributeName: self._text_color(),
+            self.NSFontAttributeName: font,
+        }
+        attributed = self.NSMutableAttributedString.alloc().initWithString_attributes_(
+            full_text,
+            attrs,
+        )
+        self._apply_block_fade(attributed, spans, font)
+        if partial:
+            partial_start = len(full_text) - len(partial)
+            partial_attrs = {
+                self.NSForegroundColorAttributeName: self._text_color(0.32),
+                self.NSFontAttributeName: font,
+            }
+            attributed.addAttributes_range_(
+                partial_attrs,
+                self.NSMakeRange(partial_start, len(partial)),
+            )
+        self.translated_view.textStorage().setAttributedString_(attributed)
+        self.translated_view.scrollRangeToVisible_(self.NSMakeRange(len(full_text), 0))
+
+    def _compose_blocks(self, blocks):
+        chunks = []
+        spans = []
+        pos = 0
+        for idx, block in enumerate(blocks):
+            sep = "\n\n\n" if block.get("gap") and chunks else ("\n\n" if chunks else "")
+            chunks.append(sep)
+            pos += len(sep)
+            text = block["text"].strip()
+            chunks.append(text)
+            spans.append((pos, len(text), idx))
+            pos += len(text)
+        return "".join(chunks), spans
+
+    def _apply_block_fade(self, attributed, spans, font):
+        total = len(spans)
+        for start, length, idx in spans:
+            age_from_end = total - idx - 1
+            alpha = 1.0 if age_from_end < 3 else max(0.48, 0.82 - age_from_end * 0.06)
+            attrs = {
+                self.NSForegroundColorAttributeName: self._text_color(alpha),
+                self.NSFontAttributeName: font,
+            }
+            attributed.addAttributes_range_(attrs, self.NSMakeRange(start, length))
+
+    def run(self):
+        self.window.makeKeyAndOrderFront_(None)
+        self.app.activateIgnoringOtherApps_(True)
+        self.AppHelper.runEventLoop()
+
+    def stop(self):
+        self.stop_event.set()
+        self.AppHelper.callAfter(self.AppHelper.stopEventLoop)
+
+
+def put_drop_oldest(q, item):
+    dropped = False
+    try:
+        q.put_nowait(item)
+    except queue.Full:
+        try:
+            q.get_nowait()
+            dropped = True
+        except queue.Empty:
+            pass
+        q.put_nowait(item)
+    return dropped
+
+
+def drain_queue_keep_latest(q, keep=0):
+    drained = []
+    while True:
+        try:
+            drained.append(q.get_nowait())
+        except queue.Empty:
+            break
+    if keep > 0 and drained:
+        for item in drained[-keep:]:
+            try:
+                q.put_nowait(item)
+            except queue.Full:
+                break
+    return max(0, len(drained) - keep)
+
+
+def enqueue_translation(
+    translation_q,
+    source_text,
+    pause_ms=0.0,
+    source_language=None,
+    start_seconds=None,
+    end_seconds=None,
+    confidence=None,
+):
+    if not source_text:
+        return
+    if translation_q.maxsize and translation_q.qsize() >= translation_q.maxsize:
+        dropped = drain_queue_keep_latest(translation_q, TRANSLATION_QUEUE_KEEP_TASKS)
+        if dropped:
+            print(
+                f"[translate] translation queue full — dropped {dropped}, keeping fresh tasks",
+                file=sys.stderr,
+            )
+    task = {
+        "source": source_text,
+        "pause_ms": float(pause_ms or 0.0),
+    }
+    if source_language:
+        # Resolved source language (e.g. Whisper's detected language in auto mode), so the
+        # prompt names a concrete source instead of "auto" and the transcript is labelled right.
+        task["source_language"] = source_language
+    if start_seconds is not None:
+        task["start_seconds"] = float(start_seconds)
+    if end_seconds is not None:
+        task["end_seconds"] = float(end_seconds)
+    if confidence is not None:
+        task["confidence"] = float(confidence)
+    dropped = put_drop_oldest(translation_q, task)
+    if dropped:
+        print("[translate] translation queue stalled — skipped old task", file=sys.stderr)
+
+
+def release_mlx_whisper_model(expected_repo=None):
+    """Drop mlx-whisper's cached model and return free MLX cache memory."""
+    try:
+        from mlx_whisper.transcribe import ModelHolder
+    except Exception as exc:  # pragma: no cover - depends on optional runtime package
+        print(f"[whisper] could not find MLX Whisper model cache: {exc}", file=sys.stderr)
+        return False
+
+    current_repo = getattr(ModelHolder, "model_path", None)
+    if expected_repo is not None and current_repo not in (None, expected_repo):
+        return False
+
+    try:
+        ModelHolder.model = None
+        ModelHolder.model_path = None
+        gc.collect()
+        try:
+            import mlx.core as mx
+
+            mx.synchronize()
+            mx.clear_cache()
+        except Exception as exc:  # pragma: no cover - depends on MLX runtime state
+            print(f"[whisper] failed to clear MLX cache: {exc}", file=sys.stderr)
+        return True
+    except Exception as exc:  # pragma: no cover - defensive worker cleanup
+        print(f"[whisper] failed to unload model: {exc}", file=sys.stderr)
+        return False
+
+
+def post_source_and_enqueue_translation(
+    translation_q,
+    overlay,
+    source_text,
+    pause_ms=0.0,
+    source_language=None,
+    start_seconds=None,
+    end_seconds=None,
+    confidence=None,
+):
+    source_text = str(source_text or "").strip()
+    if not source_text:
+        return
+    overlay.post_source(source_text, pause_ms=pause_ms)
+    enqueue_translation(
+        translation_q,
+        source_text,
+        pause_ms=pause_ms,
+        source_language=source_language,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+        confidence=confidence,
+    )
+
+
+def should_retranslate_merged_source(previous_source, incoming_source, pause_ms=0.0):
+    previous_source = str(previous_source or "").strip()
+    incoming_source = str(incoming_source or "").strip()
+    if not previous_source or not incoming_source:
+        return False
+    if len(previous_source) + len(incoming_source) > TRANSLATION_TAIL_MAX_SOURCE_MERGED_CHARS:
+        return False
+    if previous_source.endswith((",", ";", ":", "-", "—")):
+        return True
+    if ELLIPSIS_END_RE.search(previous_source):
+        return True
+    if SOFT_END_RE.search(previous_source):
+        return starts_like_continuation(incoming_source)
+    return True
+
+
+def load_vad():
+    """Lazily load Silero VAD. Returns (model, get_speech_timestamps) or (None, None)
+    so the pipeline degrades gracefully to fixed-size chunking if VAD is unavailable."""
+    try:
+        import torch  # noqa: F401
+        from silero_vad import get_speech_timestamps, load_silero_vad
+
+        return load_silero_vad(), get_speech_timestamps
+    except Exception as exc:  # pragma: no cover - env dependent
+        print(f"[VAD] unavailable, fixed chunking ({exc})", file=sys.stderr)
+        return None, None
+
+
+def _to_mono_16k(audio, samplerate):
+    import torch
+    import torchaudio
+
+    a = audio.astype(np.float32)
+    if a.ndim > 1:
+        a = a.mean(axis=1)
+    tensor = torch.from_numpy(np.ascontiguousarray(a))
+    if int(samplerate) != 16000:
+        tensor = torchaudio.functional.resample(tensor, int(samplerate), 16000)
+    return tensor
+
+
+def _to_mono_16k_np(audio, samplerate):
+    """float32 mono 16 kHz numpy array — the form mlx_whisper.transcribe accepts
+    directly, so we can skip writing a temp WAV and let mlx re-decode/resample it."""
+    return np.ascontiguousarray(_to_mono_16k(audio, samplerate).numpy(), dtype=np.float32)
+
+
+def whisper_audio_source(audio, samplerate, temp_path=None):
+    """Return audio for mlx_whisper.transcribe. Prefer an in-memory float32 mono
+    16 kHz array (skips the temp-WAV write + ffmpeg decode + resample mlx would do
+    on a file). On any failure, fall back to a WAV: reuse `temp_path` if given,
+    otherwise mkstemp a new one the caller must unlink. Returns (input, temp_path),
+    where temp_path is the path to clean up (None when the array path was used)."""
+    try:
+        return _to_mono_16k_np(audio, samplerate), None
+    except Exception:
+        owned = None
+        if temp_path is None:
+            fd, temp_path = tempfile.mkstemp(suffix=".wav", prefix="live_translate_")
+            os.close(fd)
+            owned = temp_path
+        sf.write(temp_path, audio, int(samplerate), subtype="PCM_16")
+        return temp_path, owned
+
+
+def vad_analyze(audio, samplerate, vad_model, get_speech_timestamps, min_keep_frames, min_speech_ms=250.0, prepared_wav=None):
+    """Analyze a chunk with Silero VAD. Returns (has_speech, cut):
+    - has_speech: whether enough *real* speech was detected. We require the total speech
+      duration to reach min_speech_ms — a stray blip/noise that Silero marks as a tiny
+      speech island won't pass, which keeps short bursts of noise out of Whisper.
+    - cut: a sample index (original samplerate) to cut at, in the silence right after the
+      last speech (never mid-word), or None to keep the fixed-size cut.
+    On any error returns (True, None) so the caller falls back to the RMS gate."""
+    try:
+        if prepared_wav is not None:
+            # Already resampled to 16 kHz mono this pass (shared with Whisper). Wrap the
+            # numpy view as a torch tensor for Silero — zero-copy, no second resample.
+            import torch
+
+            wav = torch.from_numpy(prepared_wav)
+        else:
+            wav = _to_mono_16k(audio, samplerate)
+        timestamps = get_speech_timestamps(wav, vad_model, sampling_rate=16000)
+    except Exception:
+        return True, None
+    if not timestamps:
+        return False, None
+    speech_16k = sum(int(t["end"]) - int(t["start"]) for t in timestamps)
+    if speech_16k < int(min_speech_ms / 1000.0 * 16000):
+        return False, None
+    total_16k = int(wav.shape[-1])
+    last_end_16k = int(timestamps[-1]["end"])
+    # Require real trailing silence after the last speech, otherwise we'd risk a mid-word cut.
+    if total_16k - last_end_16k < int(0.10 * 16000):
+        return True, None
+    cut = int(last_end_16k * samplerate / 16000)
+    if cut < min_keep_frames:
+        return True, None
+    return True, cut
+
+
+# ---------------------------------------------------------------------------
+# LocalAgreement-2 streaming (Whisper-Streaming style). Instead of cutting audio
+# into independent chunks, we keep a rolling buffer, re-transcribe it on each
+# update, and only *commit* the longest common prefix that two consecutive
+# transcriptions agree on. Committed text never changes; the unconfirmed tail is
+# shown as a live draft. This removes word breaks, dupes and false periods at
+# chunk boundaries that plain chunking produced.
+# ---------------------------------------------------------------------------
+
+def _norm_word(text):
+    return re.sub(r"[^\w'’-]", "", text).casefold()
+
+
+class HypothesisBuffer:
+    def __init__(self):
+        self.committed_in_buffer = []  # (start, end, text) absolute-time words
+        self.buffer = []               # previous hypothesis tail (unconfirmed)
+        self.new = []
+        self.last_committed_time = 0.0
+
+    def insert(self, words, offset):
+        words = [(s + offset, e + offset, t) for (s, e, t) in words]
+        self.new = [w for w in words if w[0] > self.last_committed_time - 0.1]
+
+    def flush(self):
+        # Commit the longest common prefix between the new and the previous hypothesis.
+        commit = []
+        while self.new:
+            ns, ne, nt = self.new[0]
+            if not self.buffer:
+                break
+            if _norm_word(nt) and _norm_word(nt) == _norm_word(self.buffer[0][2]):
+                commit.append((ns, ne, nt))
+                self.last_committed_time = ne
+                self.buffer.pop(0)
+                self.new.pop(0)
+            else:
+                break
+        self.buffer = self.new
+        self.new = []
+        self.committed_in_buffer.extend(commit)
+        return commit
+
+
+class OnlineProcessor:
+    def __init__(self, samplerate, max_active_seconds=14.0):
+        self.sr = samplerate
+        self.audio = None
+        self.buffer_offset = 0.0  # seconds of audio already trimmed away
+        self.hyp = HypothesisBuffer()
+        self.max_active = max_active_seconds
+
+    def active_seconds(self):
+        return 0.0 if self.audio is None else len(self.audio) / self.sr
+
+    def insert_audio(self, block):
+        self.audio = block if self.audio is None else np.concatenate((self.audio, block), axis=0)
+
+    def reset(self):
+        self.audio = None
+        self.buffer_offset = 0.0
+        self.hyp = HypothesisBuffer()
+
+    def finalize(self):
+        # Utterance ended (silence): there won't be another pass to agree with, so accept
+        # the current unconfirmed draft as final instead of dropping it. Returns its text.
+        tail = " ".join(t for (_, _, t) in self.hyp.buffer).strip()
+        self.hyp.committed_in_buffer.extend(self.hyp.buffer)
+        self.hyp.buffer = []
+        self.hyp.new = []
+        return tail
+
+    def drop_active(self):
+        # Discard buffered (silent) audio without committing anything.
+        if self.audio is not None:
+            self.buffer_offset += len(self.audio) / self.sr
+            self.audio = None
+        self.hyp.buffer = []
+        self.hyp.new = []
+
+    def _trim_to(self, t):
+        cut_idx = int((t - self.buffer_offset) * self.sr)
+        if self.audio is not None and 0 < cut_idx < len(self.audio):
+            self.audio = self.audio[cut_idx:]
+            self.buffer_offset = t
+        self.hyp.committed_in_buffer = [
+            w for w in self.hyp.committed_in_buffer if w[1] >= t - 30
+        ]
+
+    def process(self, transcribe_words_fn, prepared=None):
+        """Returns (committed_words, draft_text)."""
+        words = transcribe_words_fn(self.audio, prepared)
+        self.hyp.insert(words, self.buffer_offset)
+        committed = self.hyp.flush()
+        if committed:
+            self._trim_to(self.hyp.last_committed_time)
+        elif self.active_seconds() > self.max_active:
+            # Unstable for too long — force the buffer down so we never blow past
+            # Whisper's window or transcribe an ever-growing clip.
+            self._trim_to(self.buffer_offset + self.active_seconds() - self.max_active * 0.6)
+        draft = " ".join(t for (_, _, t) in self.hyp.buffer)
+        return committed, draft
+
+
+def audio_capture_worker(audio_q, stop_event, device, samplerate, channels, block_seconds):
+    blocksize = max(256, int(samplerate * block_seconds))
+    last_audio = {"t": time.monotonic()}
+
+    def callback(indata, frames, time_info, status):
+        if status:
+            print(status, file=sys.stderr)
+        last_audio["t"] = time.monotonic()
+        put_drop_oldest(audio_q, indata.copy())
+
+    def open_stream():
+        stream = sd.InputStream(
+            samplerate=samplerate,
+            device=device,
+            channels=channels,
+            blocksize=blocksize,
+            callback=callback,
+        )
+        stream.start()
+        return stream
+
+    # The audio device keeps delivering frames (even silence) on its own clock, so a
+    # gap with no callback means the stream stalled — e.g. CoreAudio re-inits the route
+    # when a YouTube video switches. Watch for that and transparently reopen the stream.
+    stream = None
+    while not stop_event.is_set():
+        try:
+            if stream is None:
+                stream = open_stream()
+                last_audio["t"] = time.monotonic()
+            stalled = (time.monotonic() - last_audio["t"]) > 3.0
+            inactive = not stream.active
+            if stalled or inactive:
+                print("[audio] stream stalled — restarting", file=sys.stderr)
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
+                stream = None
+                time.sleep(0.3)
+                continue
+        except Exception as exc:
+            print(f"[audio] stream error: {exc!r} — restarting", file=sys.stderr)
+            try:
+                if stream is not None:
+                    stream.stop()
+                    stream.close()
+            except Exception:
+                pass
+            stream = None
+            time.sleep(0.5)
+            continue
+        time.sleep(0.2)
+
+    if stream is not None:
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            pass
+
+
+def overlap_tail_start(cut, overlap_frames, clean_cut):
+    """Index where the next chunk's audio buffer should begin after emitting one.
+
+    Keep an overlap tail only when we had to cut mid-speech (fixed-window cut), so a word
+    straddling the boundary isn't lost. A VAD silence-aligned cut (`clean_cut`) already
+    lands between words, so the next chunk starts fresh — no re-transcribed audio and no
+    boundary duplication. Language-agnostic (VAD is language-independent) and slightly
+    faster (less audio per chunk)."""
+    if clean_cut or not overlap_frames:
+        return cut
+    return max(0, cut - overlap_frames)
+
+
+def chunk_worker(
+    audio_q,
+    chunk_q,
+    overlay,
+    stop_event,
+    samplerate,
+    chunk_seconds,
+    overlap_seconds,
+    endpointing_ms,
+    silence_rms,
+    use_vad=True,
+    min_chunk_seconds=1.2,
+    pause_emit_ms=350.0,
+    reset_gen=None,
+    vad_min_speech_ms=250.0,
+):
+    # chunk_seconds is the MAX audio window; we emit earlier whenever the speaker
+    # makes a natural pause (>= pause_emit_ms) after at least min_chunk_seconds. This
+    # keeps latency low while giving Whisper longer, sentence-complete context on
+    # run-on speech (short fixed chunks made Whisper end every piece with a period).
+    frames_needed = int(samplerate * chunk_seconds)
+    min_chunk_frames = int(samplerate * min_chunk_seconds)
+    overlap_frames = max(0, min(int(samplerate * overlap_seconds), frames_needed - 1))
+    vad_model, get_speech_timestamps = load_vad() if use_vad else (None, None)
+    min_keep_frames = int(samplerate * min(1.0, min_chunk_seconds * 0.5))
+    buffer = np.empty((0, 1), dtype=np.float32)
+    channel_count = None
+    trailing_silence_ms = 0.0
+    endpoint_sent = False
+    idle_status_posted = False
+    frames = 0
+    audio_cursor_seconds = 0.0
+    buffer_start_seconds = 0.0
+    seen_gen = reset_gen[0] if reset_gen is not None else 0
+
+    while not stop_event.is_set():
+        if reset_gen is not None and reset_gen[0] != seen_gen:
+            # Clear button: drop buffered audio so old speech can't leak through.
+            seen_gen = reset_gen[0]
+            buffer = np.empty((0, channel_count or 1), dtype=np.float32)
+            trailing_silence_ms = 0.0
+            endpoint_sent = False
+            idle_status_posted = False
+            audio_cursor_seconds = 0.0
+            buffer_start_seconds = 0.0
+            while True:
+                try:
+                    audio_q.get_nowait()
+                except queue.Empty:
+                    break
+        try:
+            block = audio_q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        try:
+            block_rms = float(np.sqrt(np.mean(np.square(block.astype(np.float32)))))
+            block_ms = len(block) / samplerate * 1000.0
+            block_start_seconds = audio_cursor_seconds
+            audio_cursor_seconds += block_ms / 1000.0
+            if block_rms >= silence_rms:
+                if idle_status_posted:
+                    overlay.post_status(0)
+                    idle_status_posted = False
+                trailing_silence_ms = 0.0
+                endpoint_sent = False
+            else:
+                trailing_silence_ms += block_ms
+                if trailing_silence_ms >= NO_SPEECH_STATUS_SECONDS * 1000.0:
+                    overlay.post_status_text("paused / waiting", alpha=0.62)
+                    idle_status_posted = True
+                if trailing_silence_ms >= endpointing_ms and not endpoint_sent:
+                    endpoint_sent = True
+                    dropped = put_drop_oldest(
+                        chunk_q,
+                        {
+                            "audio": None,
+                            "endpoint": True,
+                            "trailing_silence_ms": trailing_silence_ms,
+                        },
+                    )
+                    if dropped:
+                        print("[chunk] queue stalled — skipped old chunk, catching up", file=sys.stderr)
+                    overlay.post_status(chunk_q.qsize())
+                if len(buffer) == 0:
+                    if endpoint_sent and audio_q.qsize() > NO_SPEECH_KEEP_AUDIO_BLOCKS:
+                        drained = drain_queue_keep_latest(audio_q, NO_SPEECH_KEEP_AUDIO_BLOCKS)
+                        if drained:
+                            print(
+                                f"[chunk] no speech — dropped ~{drained * block_ms / 1000.0:.1f}s of silence",
+                                file=sys.stderr,
+                            )
+                            overlay.post_status(chunk_q.qsize())
+                    continue
+
+            if channel_count is None:
+                channel_count = block.shape[1] if block.ndim > 1 else 1
+                buffer = np.empty((0, channel_count), dtype=block.dtype)
+            if len(buffer) == 0:
+                buffer_start_seconds = block_start_seconds
+            buffer = np.concatenate((buffer, block), axis=0)
+            frames = len(buffer)
+            pause_now = frames >= min_chunk_frames and trailing_silence_ms >= pause_emit_ms
+            if frames < frames_needed and not pause_now:
+                continue
+
+            cut = min(frames, frames_needed)
+            has_speech = True
+            vad_cut = None
+            if vad_model is not None:
+                has_speech, vad_cut = vad_analyze(
+                    buffer[:cut],
+                    samplerate,
+                    vad_model,
+                    get_speech_timestamps,
+                    min_keep_frames,
+                    vad_min_speech_ms,
+                )
+                if vad_cut is not None:
+                    cut = vad_cut
+
+            audio = buffer[:cut].copy()
+            chunk_start_seconds = buffer_start_seconds
+            chunk_end_seconds = chunk_start_seconds + len(audio) / samplerate
+            tail_start = overlap_tail_start(cut, overlap_frames, clean_cut=vad_cut is not None)
+            buffer = buffer[tail_start:]
+            buffer_start_seconds += tail_start / samplerate
+            frames = len(buffer)
+
+            # Don't send silence/music to Whisper: VAD says no speech (or RMS too low when
+            # VAD is off). Feeding long pauses to Whisper is what stalled the pipeline.
+            if not has_speech:
+                continue
+            rms = float(np.sqrt(np.mean(np.square(audio.astype(np.float32)))))
+            if rms < silence_rms:
+                continue
+            # Recovery-first: under normal load every chunk is processed once; if the
+            # transcribe/translate worker falls badly behind, keep the freshest chunks
+            # instead of blocking forever on stale audio.
+            if chunk_q.maxsize and chunk_q.qsize() >= chunk_q.maxsize:
+                drained = drain_queue_keep_latest(chunk_q, CHUNK_PRODUCER_KEEP_CHUNKS)
+                if drained:
+                    print(
+                        f"[chunk] queue full — dropped {drained}, keeping fresh tail",
+                        file=sys.stderr,
+                    )
+            dropped = put_drop_oldest(
+                chunk_q,
+                {
+                    "audio": audio,
+                    "endpoint": trailing_silence_ms >= endpointing_ms,
+                    "trailing_silence_ms": trailing_silence_ms,
+                    "start_seconds": chunk_start_seconds,
+                    "end_seconds": chunk_end_seconds,
+                },
+            )
+            if dropped:
+                print("[chunk] queue stalled — skipped old chunk, catching up", file=sys.stderr)
+            overlay.post_status(chunk_q.qsize())
+        except Exception as exc:
+            # Never let the chunk thread die silently — that permanently stops transcription.
+            print(f"[chunk] error: {exc!r} — continuing", file=sys.stderr)
+            buffer = np.empty((0, channel_count or 1), dtype=np.float32)
+            trailing_silence_ms = 0.0
+            time.sleep(0.1)
+            continue
+
+
+def transcribe_translate_worker(
+    chunk_q,
+    translation_q,
+    overlay,
+    stop_event,
+    samplerate,
+    settings,
+    sentence_mode,
+    min_block_chars,
+    max_block_chars,
+    max_sentences,
+    mutable_tail_seconds,
+    endpointing_ms,
+    endpoint_min_words,
+    max_partial_seconds,
+    word_timestamps,
+    reset_gen=None,
+):
+    import mlx_whisper
+
+    last_text = ""
+    tail_history = []
+    sentence_buffer = ""
+    buffer_started_at = None
+    buffer_source_language = None
+    buffer_start_seconds = None
+    buffer_end_seconds = None
+    recent_context = ""  # last committed/emitted text, fed to Whisper as initial_prompt
+    active_whisper_repo = None
+    committed_until_seconds = None  # global time covered so far, for time-based seam dedup
+    seen_gen = reset_gen[0] if reset_gen is not None else 0
+
+    def maybe_log_slow(label, started_at, extra=""):
+        elapsed = time.monotonic() - started_at
+        if elapsed >= SLOW_STEP_LOG_SECONDS:
+            suffix = f" {extra}" if extra else ""
+            print(f"[{label}] slow: {elapsed:.1f}s{suffix}", file=sys.stderr)
+
+    def note_context(text):
+        # Keep the most recent ~240 chars of finalized text to condition the next chunk.
+        nonlocal recent_context
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            recent_context = f"{recent_context} {text}".strip()[-240:]
+
+    def refresh_tail(now):
+        nonlocal tail_history
+        tail_history = [
+            (stamp, value)
+            for stamp, value in tail_history
+            if now - stamp <= mutable_tail_seconds
+        ]
+        return " ".join(value for _, value in tail_history)[-600:]
+
+    def emit_final_blocks(
+        force_unfinished=False,
+        include_latest_sentence=False,
+        pause_ms=0.0,
+        source_language=None,
+        start_seconds=None,
+        end_seconds=None,
+    ):
+        nonlocal buffer_source_language, sentence_buffer, buffer_started_at
+        nonlocal buffer_start_seconds, buffer_end_seconds
+        previous_buffer = sentence_buffer
+        resolved_source_language = source_language or buffer_source_language
+        if force_unfinished:
+            blocks, sentence_buffer = take_endpoint_blocks(
+                sentence_buffer,
+                min_chars=min_block_chars,
+                max_chars=max_block_chars,
+                min_words=endpoint_min_words,
+            )
+        elif include_latest_sentence:
+            blocks, sentence_buffer = take_blocks_for_translation(
+                sentence_buffer,
+                min_chars=min_block_chars,
+                max_chars=max_block_chars,
+                max_sentences=max_sentences,
+                force=True,
+            )
+        else:
+            blocks, sentence_buffer = take_confirmed_blocks_for_translation(
+                sentence_buffer,
+                min_chars=min_block_chars,
+                max_chars=max_block_chars,
+                max_sentences=max_sentences,
+            )
+        for source_text in blocks:
+            source_text = sentence_case_text(source_text)
+            phrase_start = buffer_start_seconds if buffer_start_seconds is not None else start_seconds
+            phrase_end = end_seconds if end_seconds is not None else buffer_end_seconds
+            post_source_and_enqueue_translation(
+                translation_q,
+                overlay,
+                source_text,
+                pause_ms=pause_ms,
+                source_language=resolved_source_language,
+                start_seconds=phrase_start,
+                end_seconds=phrase_end,
+            )
+            note_context(source_text)
+        overlay.post_partial(sentence_case_text(sentence_buffer))
+        if not sentence_buffer:
+            buffer_started_at = None
+            buffer_source_language = None
+            buffer_start_seconds = None
+            buffer_end_seconds = None
+        elif blocks or sentence_buffer != previous_buffer or buffer_started_at is None:
+            buffer_started_at = time.monotonic()
+            if blocks and end_seconds is not None:
+                buffer_start_seconds = end_seconds
+
+    while not stop_event.is_set():
+        if reset_gen is not None and reset_gen[0] != seen_gen:
+            # Clear button pressed: wipe all rolling state and pending chunks so
+            # transcription/translation truly start from a clean slate.
+            seen_gen = reset_gen[0]
+            last_text = ""
+            tail_history.clear()
+            sentence_buffer = ""
+            buffer_started_at = None
+            buffer_source_language = None
+            buffer_start_seconds = None
+            buffer_end_seconds = None
+            recent_context = ""
+            committed_until_seconds = None
+            if active_whisper_repo:
+                release_mlx_whisper_model(active_whisper_repo)
+                active_whisper_repo = None
+            while True:
+                try:
+                    chunk_q.get_nowait()
+                except queue.Empty:
+                    break
+            while True:
+                try:
+                    translation_q.get_nowait()
+                except queue.Empty:
+                    break
+
+        if chunk_q.maxsize and chunk_q.qsize() >= chunk_q.maxsize:
+            dropped = drain_queue_keep_latest(chunk_q, CHUNK_CATCHUP_KEEP_CHUNKS)
+            if dropped:
+                last_text = ""
+                if sentence_buffer.strip():
+                    emit_final_blocks(force_unfinished=True, pause_ms=0.0)
+                overlay.post_status(chunk_q.qsize())
+                print(
+                    f"[transcribe] chunk queue full — dropped {dropped}, taking fresh ones; phrase buffer preserved",
+                    file=sys.stderr,
+                )
+
+        try:
+            item = chunk_q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        overlay.post_status(chunk_q.qsize())
+
+        if isinstance(item, dict):
+            audio = item.get("audio")
+            is_endpoint = bool(item.get("endpoint"))
+            trailing_silence_ms = float(item.get("trailing_silence_ms") or 0.0)
+            item_start_seconds = item.get("start_seconds")
+            item_end_seconds = item.get("end_seconds")
+        else:
+            audio = item
+            is_endpoint = False
+            trailing_silence_ms = 0.0
+            item_start_seconds = None
+            item_end_seconds = None
+
+        if audio is None:
+            if is_endpoint and sentence_mode:
+                emit_final_blocks(include_latest_sentence=True, pause_ms=trailing_silence_ms)
+            continue
+
+        temp_path = None
+        try:
+            whisper_input, temp_path = whisper_audio_source(audio, samplerate)
+            source_language, target_language = settings.get()
+            # Feed the recently finalized text as initial_prompt: gives cross-chunk
+            # context (punctuation, casing, word continuity at boundaries) without the
+            # runaway-hallucination risk of condition_on_previous_text=True. Skip it
+            # when that context has no punctuation, or it reinforces Whisper's drift
+            # into never punctuating (see punctuated_context).
+            context_prompt = punctuated_context(f"{recent_context} {sentence_buffer}")
+            whisper_size = settings.get_whisper_size()
+            whisper_repo = WHISPER_MODELS[whisper_size]
+            if active_whisper_repo and active_whisper_repo != whisper_repo:
+                release_mlx_whisper_model(active_whisper_repo)
+            if active_whisper_repo != whisper_repo:
+                overlay.post_status_text(
+                    f"Loading {WHISPER_LABELS.get(whisper_size, 'Whisper')}...",
+                    alpha=0.78,
+                )
+            gen_at_start = reset_gen[0] if reset_gen is not None else seen_gen
+            transcribe_started = time.monotonic()
+            result = mlx_whisper.transcribe(
+                whisper_input,
+                path_or_hf_repo=whisper_repo,
+                language=None if source_language == "auto" else source_language,
+                condition_on_previous_text=False,
+                initial_prompt=context_prompt,
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.4,
+                logprob_threshold=-1.0,
+                temperature=(0.0, 0.2),
+                word_timestamps=word_timestamps,
+                verbose=False,
+            )
+            active_whisper_repo = whisper_repo
+            detected_source_language = str(result.get("language") or "").strip()
+            resolved_source_language = (
+                detected_source_language
+                if source_language == "auto" and detected_source_language
+                else source_language
+            )
+            maybe_log_slow("whisper", transcribe_started, f"size={whisper_size}")
+            if reset_gen is not None and reset_gen[0] != gen_at_start:
+                # Clear was pressed while this chunk was inside Whisper — drop its result.
+                continue
+            if word_timestamps:
+                last_word_end = last_word_end_seconds(result)
+                if last_word_end is not None:
+                    audio_duration = len(audio) / samplerate
+                    word_gap_ms = max(0.0, (audio_duration - last_word_end) * 1000.0)
+                    trailing_silence_ms = max(trailing_silence_ms, word_gap_ms)
+                    is_endpoint = is_endpoint or trailing_silence_ms >= endpointing_ms
+
+            # Time-based seam dedup: when this chunk overlaps the previously covered audio
+            # (only on mid-speech cuts now), drop the re-transcribed overlap words by their
+            # timestamps instead of by spelling — this catches inflection changes and
+            # split words that text matching misses. On a clean cut the timeline is
+            # contiguous, so nothing is dropped and we keep Whisper's well-formed text.
+            abs_words = absolute_words(result, item_start_seconds) if word_timestamps else []
+            if abs_words:
+                overlap_present = (
+                    committed_until_seconds is not None
+                    and item_start_seconds is not None
+                    and float(item_start_seconds) < committed_until_seconds
+                )
+                deduped_text, committed_until_seconds = dedup_words_by_time(
+                    abs_words, committed_until_seconds
+                )
+                raw_text = deduped_text if overlap_present else str(result.get("text", ""))
+            else:
+                raw_text = str(result.get("text", ""))
+            text = re.sub(r"\s+", " ", raw_text).strip()
+            text = strip_hallucinations(text)
+            if len(text) < 2:
+                continue
+            if text == last_text:
+                continue
+            last_text = text
+
+            now = time.monotonic()
+            last_tail = refresh_tail(now)
+            text = merge_overlap_text(last_tail, text)
+            if not text:
+                continue
+            tail_history.append((now, text))
+
+            if sentence_mode:
+                sentence_buffer = merge_partial_buffer(sentence_buffer, text)
+                if buffer_start_seconds is None and item_start_seconds is not None:
+                    buffer_start_seconds = float(item_start_seconds)
+                if item_end_seconds is not None:
+                    buffer_end_seconds = float(item_end_seconds)
+                if (
+                    source_language == "auto"
+                    and resolved_source_language
+                    and resolved_source_language != "auto"
+                    and buffer_source_language is None
+                ):
+                    buffer_source_language = resolved_source_language
+                if sentence_buffer and buffer_started_at is None:
+                    buffer_started_at = now
+                overlay.post_partial(sentence_case_text(sentence_buffer))
+                buffer_age = (now - buffer_started_at) if buffer_started_at else 0.0
+                stable_timeout = max_partial_seconds > 0 and buffer_age >= max_partial_seconds
+                too_long = len(sentence_buffer) >= max_block_chars
+                if stable_timeout or too_long:
+                    emit_final_blocks(
+                        force_unfinished=True,
+                        pause_ms=trailing_silence_ms,
+                        source_language=resolved_source_language,
+                        start_seconds=item_start_seconds,
+                        end_seconds=item_end_seconds,
+                    )
+                elif is_endpoint:
+                    emit_final_blocks(
+                        include_latest_sentence=True,
+                        pause_ms=trailing_silence_ms,
+                        source_language=resolved_source_language,
+                        start_seconds=item_start_seconds,
+                        end_seconds=item_end_seconds,
+                    )
+                else:
+                    emit_final_blocks(
+                        source_language=resolved_source_language,
+                        start_seconds=item_start_seconds,
+                        end_seconds=item_end_seconds,
+                    )
+            else:
+                enqueue_translation(
+                    translation_q,
+                    sentence_case_text(text),
+                    source_language=resolved_source_language,
+                    start_seconds=item_start_seconds,
+                    end_seconds=item_end_seconds,
+                )
+                note_context(text)
+        except Exception as exc:
+            overlay.post_pair("", f"Error: {exc}")
+            time.sleep(1.0)
+        finally:
+            if temp_path:
+                Path(temp_path).unlink(missing_ok=True)
+
+
+def translation_history(recent_pairs, exclude_last):
+    """Most recent committed (source, translated) pairs as translator context, newest last,
+    bounded by count and total chars. `exclude_last` drops the newest pair — used when it's
+    being merged into the current source, so it isn't duplicated as context."""
+    pairs = recent_pairs[:-1] if exclude_last and recent_pairs else list(recent_pairs)
+    selected = []
+    total = 0
+    for src, tgt in reversed(pairs):
+        if len(selected) >= TRANSLATION_HISTORY_MAX_PAIRS:
+            break
+        total += len(str(src)) + len(str(tgt))
+        if selected and total > TRANSLATION_HISTORY_MAX_CHARS:
+            break
+        selected.append((src, tgt))
+    return list(reversed(selected))
+
+
+def translation_worker(translation_q, overlay, translator, stop_event, settings, reset_gen=None):
+    seen_gen = reset_gen[0] if reset_gen is not None else 0
+    last_source = ""
+    recent_pairs = []  # committed (source, translated) context for terminology continuity
+    active_ollama_model = None
+
+    def maybe_log_slow(label, started_at, extra=""):
+        elapsed = time.monotonic() - started_at
+        if elapsed >= SLOW_STEP_LOG_SECONDS:
+            suffix = f" {extra}" if extra else ""
+            print(f"[{label}] slow: {elapsed:.1f}s{suffix}", file=sys.stderr)
+
+    while not stop_event.is_set():
+        if reset_gen is not None and reset_gen[0] != seen_gen:
+            seen_gen = reset_gen[0]
+            last_source = ""
+            recent_pairs = []
+            active_ollama_model = None
+            while True:
+                try:
+                    translation_q.get_nowait()
+                except queue.Empty:
+                    break
+
+        if translation_q.maxsize and translation_q.qsize() >= translation_q.maxsize:
+            dropped = drain_queue_keep_latest(translation_q, TRANSLATION_QUEUE_KEEP_TASKS)
+            if dropped:
+                print(
+                    f"[translate] translation queue full — dropped {dropped}, taking fresh ones",
+                    file=sys.stderr,
+                )
+
+        try:
+            item = translation_q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+
+        if not isinstance(item, dict):
+            continue
+        source_text = str(item.get("source") or "").strip()
+        pause_ms = float(item.get("pause_ms") or 0.0)
+        task_source_language = str(item.get("source_language") or "").strip()
+        start_seconds = item.get("start_seconds")
+        end_seconds = item.get("end_seconds")
+        confidence = item.get("confidence")
+        if not source_text:
+            continue
+
+        should_replace_tail = should_retranslate_merged_source(
+            last_source,
+            source_text,
+            pause_ms=pause_ms,
+        )
+        combined_source = (
+            f"{last_source.rstrip()} {source_text}".strip()
+            if should_replace_tail
+            else source_text
+        )
+
+        gen_at_start = reset_gen[0] if reset_gen is not None else seen_gen
+        source_language, target_language = settings.get()
+        ollama_model = settings.get_ollama_model()
+        translator.set_target(target_language)
+        # Prefer the source language resolved by the producer (Whisper detection); fall back
+        # to the configured one (possibly "auto") when the task didn't carry it.
+        translator.set_source(task_source_language or source_language)
+        translator.set_model(ollama_model)
+        try:
+            if active_ollama_model != ollama_model:
+                overlay.post_status_text(
+                    f"Loading {GEMMA_MODELS.get(ollama_model, ollama_model)}...",
+                    alpha=0.78,
+                )
+            translate_started = time.monotonic()
+            max_tokens = translation_token_budget(
+                combined_source,
+                getattr(translator, "max_tokens", 180),
+            )
+            # Stream the translation into the overlay as it's generated so the user sees it
+            # arrive instead of waiting for the whole block. Skip streaming for the
+            # "revised" merge path (replace_translation_tail), where a live draft below the
+            # still-shown previous tail would read as duplicated text.
+            def on_delta(partial, _gen=gen_at_start):
+                if reset_gen is not None and reset_gen[0] != _gen:
+                    return
+                overlay.post_partial_translation(partial)
+
+            history = translation_history(recent_pairs, exclude_last=should_replace_tail)
+            translated = translator.translate(
+                combined_source,
+                max_tokens=max_tokens,
+                on_delta=None if should_replace_tail else on_delta,
+                history=history,
+            )
+            maybe_log_slow(
+                "translate",
+                translate_started,
+                f"model={ollama_model} chars={len(combined_source)} max_tokens={max_tokens}",
+            )
+            active_ollama_model = ollama_model
+            if reset_gen is not None and reset_gen[0] != gen_at_start:
+                continue
+            if translated:
+                overlay.post_pair(
+                    source_text,
+                    translated,
+                    pause_ms=pause_ms,
+                    replace_translation_tail=should_replace_tail,
+                    combined_source=combined_source,
+                    append_source=False,
+                    source_language=task_source_language or source_language,
+                    start_seconds=start_seconds,
+                    end_seconds=end_seconds,
+                    confidence=confidence,
+                )
+                last_source = combined_source
+                # Keep the committed pair as context for the next block. On the "revised"
+                # merge path it supersedes the previous pair rather than adding a new one.
+                if should_replace_tail and recent_pairs:
+                    recent_pairs[-1] = (combined_source, translated)
+                else:
+                    recent_pairs.append((combined_source, translated))
+                del recent_pairs[: -(TRANSLATION_HISTORY_MAX_PAIRS + 1)]
+        except Exception as exc:
+            overlay.post_partial_translation("")  # drop any half-streamed draft
+            overlay.post_pair("", f"Error: {exc}")
+            time.sleep(1.0)
+
+
+def streaming_worker(
+    audio_q,
+    translation_q,
+    overlay,
+    translator,
+    stop_event,
+    samplerate,
+    settings,
+    min_block_chars,
+    max_block_chars,
+    max_sentences,
+    endpoint_min_words,
+    endpointing_ms,
+    silence_rms=0.006,
+    reset_gen=None,
+    use_vad=True,
+    vad_min_speech_ms=250.0,
+    update_seconds=1.0,
+    block_seconds=0.2,
+):
+    """LocalAgreement-2 streaming transcription + translation."""
+    import mlx_whisper
+
+    proc = OnlineProcessor(samplerate)
+    committed_text = ""   # confirmed words not yet emitted as a full sentence
+    recent_context = ""   # fed to Whisper as initial_prompt
+    detected_lang = "auto"  # Whisper's detected source language (labels phrases / prompt source)
+    active_whisper_repo = None
+    pending_seconds = 0.0
+    trailing_silence_ms = 0.0
+    stream_cursor_seconds = 0.0
+    committed_start_seconds = None
+    endpoint_sent = False
+    idle_status_posted = False
+    seen_gen = reset_gen[0] if reset_gen is not None else 0
+    vad_model, get_speech_timestamps = load_vad() if use_vad else (None, None)
+    fd, temp_path = tempfile.mkstemp(suffix=".wav", prefix="live_stream_")
+    os.close(fd)
+
+    def note_context(text):
+        nonlocal recent_context
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            recent_context = f"{recent_context} {text}".strip()[-240:]
+
+    def transcribe_words(audio, prepared=None):
+        nonlocal active_whisper_repo, detected_lang
+        source_language, _ = settings.get()
+        whisper_size = settings.get_whisper_size()
+        whisper_repo = WHISPER_MODELS[whisper_size]
+        if active_whisper_repo and active_whisper_repo != whisper_repo:
+            release_mlx_whisper_model(active_whisper_repo)
+        if active_whisper_repo != whisper_repo:
+            overlay.post_status_text(
+                f"Loading {WHISPER_LABELS.get(whisper_size, 'Whisper')}...",
+                alpha=0.78,
+            )
+        # `prepared` is the float32 mono 16 kHz array already computed for VAD this
+        # pass — reuse it so we resample the rolling buffer once, not twice. Skips the
+        # temp-WAV write + mlx's ffmpeg decode/resample too.
+        if prepared is not None:
+            whisper_input = prepared
+        else:
+            whisper_input, _ = whisper_audio_source(audio, samplerate, temp_path)
+        context = punctuated_context(f"{recent_context} {committed_text}")
+        result = mlx_whisper.transcribe(
+            whisper_input,
+            path_or_hf_repo=whisper_repo,
+            language=None if source_language == "auto" else source_language,
+            condition_on_previous_text=False,
+            initial_prompt=context,
+            no_speech_threshold=0.6,
+            compression_ratio_threshold=2.4,
+            logprob_threshold=-1.0,
+            temperature=0.0,  # no fallback retries — re-transcription self-corrects next pass
+            word_timestamps=True,
+            verbose=False,
+        )
+        active_whisper_repo = whisper_repo
+        detected_lang = result.get("language") or detected_lang
+        words = []
+        for seg in result.get("segments", []):
+            for w in seg.get("words", []) or []:
+                t = (w.get("word") or "").strip()
+                if t:
+                    words.append((float(w.get("start", 0.0)), float(w.get("end", 0.0)), t))
+        return words
+
+    def emit_sentences(force=False, pause_ms=0.0):
+        nonlocal committed_text, committed_start_seconds
+        committed_text = strip_hallucinations(committed_text)
+        blocks, committed_text = take_blocks_for_translation(
+            committed_text, min_block_chars, max_block_chars, max_sentences, force=force
+        )
+        if not blocks and (force or len(committed_text) >= max_block_chars):
+            extra, committed_text = take_endpoint_blocks(
+                committed_text, min_block_chars, max_block_chars, endpoint_min_words
+            )
+            blocks += extra
+        for block in blocks:
+            source_language, _ = settings.get()
+            resolved_source = detected_lang if source_language == "auto" else source_language
+            src = sentence_case_text(block)
+            phrase_start = committed_start_seconds
+            phrase_end = max(float(phrase_start or 0.0) + 0.001, stream_cursor_seconds)
+            # Hand the block to the translation worker instead of blocking this audio-reader
+            # thread on the translation service; otherwise latency stalls transcription and the
+            # audio queue overflows.
+            post_source_and_enqueue_translation(
+                translation_q,
+                overlay,
+                src,
+                pause_ms=pause_ms,
+                source_language=resolved_source,
+                start_seconds=phrase_start,
+                end_seconds=phrase_end,
+            )
+            note_context(src)
+        if blocks:
+            committed_start_seconds = stream_cursor_seconds if committed_text.strip() else None
+
+    while not stop_event.is_set():
+        if reset_gen is not None and reset_gen[0] != seen_gen:
+            seen_gen = reset_gen[0]
+            proc.reset()
+            committed_text = ""
+            recent_context = ""
+            stream_cursor_seconds = 0.0
+            committed_start_seconds = None
+            if active_whisper_repo:
+                release_mlx_whisper_model(active_whisper_repo)
+                active_whisper_repo = None
+            pending_seconds = 0.0
+            trailing_silence_ms = 0.0
+            endpoint_sent = False
+            idle_status_posted = False
+            while True:
+                try:
+                    audio_q.get_nowait()
+                except queue.Empty:
+                    break
+
+        # Catch-up: if transcription can't keep pace and the audio queue is piling up,
+        # skip the stale backlog and jump back to live. Reset the rolling Whisper state
+        # too; otherwise it can keep re-transcribing stale buffered audio and never commit
+        # new translation blocks after overload.
+        if audio_q.qsize() > STREAM_CATCHUP_HIGH_WATER:
+            dropped = 0
+            while audio_q.qsize() > STREAM_CATCHUP_KEEP_BLOCKS:
+                try:
+                    audio_q.get_nowait()
+                    dropped += 1
+                except queue.Empty:
+                    break
+            if dropped:
+                tail = proc.finalize()
+                if tail:
+                    committed_text = f"{committed_text} {tail}".strip()
+                    emit_sentences(force=True, pause_ms=dropped * block_seconds * 1000.0)
+                proc.reset()
+                pending_seconds = 0.0
+                print(
+                    f"[stream] lagging — skipped ~{dropped * block_seconds:.1f}s of audio, catching up",
+                    file=sys.stderr,
+                )
+                overlay.post_status(audio_q.qsize())
+
+        try:
+            block = audio_q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        try:
+            force_endpoint_process = False
+            block_ms = len(block) / samplerate * 1000.0
+            block_start_seconds = stream_cursor_seconds
+            stream_cursor_seconds += block_ms / 1000.0
+            block_rms = float(np.sqrt(np.mean(np.square(block.astype(np.float32)))))
+            if block_rms < silence_rms:
+                trailing_silence_ms += block_ms
+                if trailing_silence_ms >= NO_SPEECH_STATUS_SECONDS * 1000.0:
+                    overlay.post_status_text("paused / waiting", alpha=0.62)
+                    idle_status_posted = True
+                if trailing_silence_ms >= endpointing_ms and not endpoint_sent:
+                    if proc.audio is not None and proc.active_seconds() > 0:
+                        force_endpoint_process = True
+                        pending_seconds = update_seconds
+                    else:
+                        tail = proc.finalize()
+                        if tail:
+                            committed_text = f"{committed_text} {tail}".strip()
+                        proc.drop_active()
+                        pending_seconds = 0.0
+                        endpoint_sent = True
+                        if committed_text.strip():
+                            emit_sentences(force=True, pause_ms=trailing_silence_ms)
+                        overlay.post_partial("")
+                if endpoint_sent and audio_q.qsize() > NO_SPEECH_KEEP_AUDIO_BLOCKS:
+                    drained = drain_queue_keep_latest(audio_q, NO_SPEECH_KEEP_AUDIO_BLOCKS)
+                    if drained:
+                        print(
+                            f"[stream] no speech — dropped ~{drained * block_ms / 1000.0:.1f}s of silence",
+                            file=sys.stderr,
+                        )
+                        overlay.post_status(audio_q.qsize())
+                if not force_endpoint_process:
+                    continue
+
+            if block_rms >= silence_rms:
+                if idle_status_posted:
+                    overlay.post_status(0)
+                    idle_status_posted = False
+                trailing_silence_ms = 0.0
+                endpoint_sent = False
+                proc.insert_audio(block)
+                pending_seconds += len(block) / samplerate
+            if pending_seconds < update_seconds:
+                continue
+            pending_seconds = 0.0
+
+            # Resample the rolling buffer to 16 kHz mono once per pass and share it with
+            # both the VAD speech-gate and Whisper below — they both need exactly this.
+            prepared = None
+            if proc.audio is not None:
+                try:
+                    prepared = _to_mono_16k_np(proc.audio, samplerate)
+                except Exception:
+                    prepared = None
+
+            # Skip pure silence/non-speech: don't re-transcribe it (hallucination source).
+            if vad_model is not None and proc.audio is not None:
+                has_speech, _ = vad_analyze(
+                    proc.audio, samplerate, vad_model, get_speech_timestamps, 0,
+                    vad_min_speech_ms, prepared_wav=prepared,
+                )
+                if not has_speech:
+                    # Commit the still-unconfirmed tail before dropping the audio, otherwise
+                    # the last words of every utterance are lost at the pause.
+                    tail = proc.finalize()
+                    if tail:
+                        committed_text = f"{committed_text} {tail}".strip()
+                    proc.drop_active()
+                    pending_seconds = 0.0
+                    drained = drain_queue_keep_latest(audio_q, NO_SPEECH_KEEP_AUDIO_BLOCKS)
+                    if drained:
+                        print(
+                            f"[stream] no speech — dropped ~{drained * block_seconds:.1f}s of audio",
+                            file=sys.stderr,
+                        )
+                        overlay.post_status(audio_q.qsize())
+                    if committed_text.strip():
+                        emit_sentences(force=True, pause_ms=1000)  # pause => flush sentence
+                    overlay.post_partial("")
+                    continue
+
+            gen_before = reset_gen[0] if reset_gen is not None else seen_gen
+            committed, draft = proc.process(transcribe_words, prepared=prepared)
+            if reset_gen is not None and reset_gen[0] != gen_before:
+                continue
+            for (_, _, t) in committed:
+                committed_text = f"{committed_text} {t}".strip()
+            if committed and committed_start_seconds is None:
+                committed_start_seconds = float(committed[0][0])
+            if committed_text.strip() and committed_start_seconds is None:
+                committed_start_seconds = block_start_seconds
+
+            if force_endpoint_process:
+                tail = proc.finalize()
+                if tail:
+                    committed_text = f"{committed_text} {tail}".strip()
+                proc.drop_active()
+                endpoint_sent = True
+                if committed_text.strip():
+                    emit_sentences(force=True, pause_ms=trailing_silence_ms)
+                overlay.post_partial("")
+                overlay.post_status(audio_q.qsize())
+                continue
+
+            emit_sentences(force=False)
+
+            draft_clean = strip_hallucinations(draft)
+            live = f"{committed_text} {draft_clean}".strip()
+            overlay.post_partial(sentence_case_text(live))
+            overlay.post_status(audio_q.qsize())
+        except Exception as exc:
+            print(f"[stream] error: {exc!r} — continuing", file=sys.stderr)
+            time.sleep(0.2)
+
+    Path(temp_path).unlink(missing_ok=True)
+
+
+def build_translator(args):
+    translator = OpenAITranslator(
+        model=args.ollama_model,
+        target=args.target,
+        url=args.openai_url,
+        max_tokens=args.max_tokens,
+        source=args.source,
+    )
+    return translator
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Real-time local speech transcription + OpenAI translation + macOS glass overlay."
+    )
+    p.add_argument("--list", action="store_true", help="list audio devices and exit")
+    p.add_argument("--device", type=int, default=None, help="input audio device index")
+    p.add_argument("--source", default="ja", help="speech language (default: ja)")
+    p.add_argument("--target", default="zh", help="translation language (default: zh, Simplified Chinese)")
+    p.add_argument(
+        "--whisper",
+        choices=WHISPER_MODELS.keys(),
+        default="turbo",
+        help="MLX Whisper size: small/medium/turbo/large",
+    )
+    p.add_argument(
+        "--ollama-model",
+        choices=GEMMA_MODELS.keys(),
+        default="gpt-6-luna",
+        help="OpenAI translation model",
+    )
+    p.add_argument(
+        "--openai-url",
+        default="https://api.openai.com/v1/responses",
+        help="OpenAI Responses API URL",
+    )
+    p.add_argument("--chunk-seconds", type=float, default=6.0, help="MAX audio chunk (window) size in seconds")
+    p.add_argument(
+        "--min-chunk-seconds",
+        type=float,
+        default=1.2,
+        help="minimum audio before splitting chunk on pause",
+    )
+    p.add_argument(
+        "--pause-emit-ms",
+        type=float,
+        default=350.0,
+        help="pause (ms) at which to emit a chunk without waiting for MAX window",
+    )
+    p.add_argument("--overlap-seconds", type=float, default=0.75, help="overlap between chunks")
+    p.add_argument("--block-seconds", type=float, default=0.20, help="recording block size in seconds")
+    p.add_argument(
+        "--endpointing-ms",
+        type=float,
+        default=1000.0,
+        help="how many ms of silence to treat as end of utterance",
+    )
+    p.add_argument(
+        "--endpoint-min-words",
+        type=int,
+        default=24,
+        help="emergency minimum words for forced flush without punctuation",
+    )
+    p.add_argument(
+        "--max-partial-seconds",
+        type=float,
+        default=0.0,
+        help="max time to hold live partial before stable commit; 0 = wait for semantic boundary",
+    )
+    p.add_argument(
+        "--mutable-tail-seconds",
+        type=float,
+        default=8.0,
+        help="how many seconds of recent text to keep mutable for overlap deduplication",
+    )
+    p.add_argument(
+        "--no-word-timestamps",
+        action="store_true",
+        help="disable Whisper word timestamps for endpointing",
+    )
+    p.add_argument(
+        "--audio-queue",
+        type=int,
+        default=DEFAULT_AUDIO_QUEUE_BLOCKS,
+        help=(
+            "raw audio block buffer; when full old audio is dropped so translation can recover; 0 = unlimited"
+        ),
+    )
+    p.add_argument("--chunk-queue", type=int, default=8, help="chunk buffer for transcription")
+    p.add_argument(
+        "--translation-queue",
+        type=int,
+        default=4,
+        help="text block buffer for translation; when full old tasks are dropped",
+    )
+    p.add_argument(
+        "--no-sentence-mode",
+        action="store_true",
+        help="translate each recognised chunk immediately without waiting for sentence end",
+    )
+    p.add_argument(
+        "--min-block-chars",
+        type=int,
+        default=90,
+        help="minimum semantic block size before translation",
+    )
+    p.add_argument(
+        "--max-block-chars",
+        type=int,
+        default=1200,
+        help="maximum semantic block size before translation",
+    )
+    p.add_argument(
+        "--max-sentences",
+        type=int,
+        default=5,
+        help="maximum sentences per translator call",
+    )
+    p.add_argument("--silence-rms", type=float, default=0.006, help="silence threshold (stricter = higher)")
+    p.add_argument(
+        "--no-vad",
+        action="store_true",
+        help="disable silence-aligned chunking via Silero VAD (fixed chunks)",
+    )
+    p.add_argument(
+        "--vad-min-speech-ms",
+        type=float,
+        default=250.0,
+        help="minimum total speech in chunk (ms), otherwise chunk is treated as silent and skipped",
+    )
+    p.add_argument(
+        "--legacy-chunking",
+        dest="legacy_chunking",
+        action="store_true",
+        default=True,
+        help=argparse.SUPPRESS,  # now the default; kept so the .app launcher's flag still works
+    )
+    p.add_argument(
+        "--streaming",
+        dest="legacy_chunking",
+        action="store_false",
+        help="use LocalAgreement streaming (smoother, but lossy under load); "
+        "default is the lossless chunker",
+    )
+    p.add_argument(
+        "--update-seconds",
+        type=float,
+        default=1.5,
+        help="how often (in seconds of accumulated audio) to re-recognise buffer in LocalAgreement mode",
+    )
+    p.add_argument("--max-tokens", type=int, default=180, help="translation token limit")
+    p.add_argument(
+        "--ollama-num-ctx",
+        type=int,
+        default=4096,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument("--temperature", type=float, default=0.1, help="LLM temperature")
+    p.add_argument(
+        "--reasoning",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument("--width", type=int, default=1100, help="window width")
+    p.add_argument("--height", type=int, default=520, help="window height")
+    p.add_argument("--opacity", type=float, default=1.0, help=argparse.SUPPRESS)
+    p.add_argument(
+        "--show-partial",
+        action="store_true",
+        help="show live draft before finalisation; by default the UI shows only completed blocks",
+    )
+    p.add_argument("--no-window", action="store_true", help="print to terminal instead of showing window")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.list:
+        list_devices()
+        return
+
+    device = args.device
+    if device is None:
+        device, name = find_blackhole()
+        if device is None:
+            sys.exit(
+                "BlackHole not found. Install `brew install blackhole-2ch`, "
+                "set up a Multi-Output Device, or pass --device N (see --list)."
+            )
+        print(f"Found device: [{device}] {name}")
+
+    info = cast(dict, sd.query_devices(device))
+    samplerate = float(info["default_samplerate"])
+    channels = min(2, int(info["max_input_channels"])) or 1
+
+    stop_event = threading.Event()
+    reset_gen = [0]  # bumped by the Clear button to wipe both workers' state
+    settings = LanguageSettings(
+        args.source,
+        args.target,
+        whisper_size=args.whisper,
+        ollama_model=args.ollama_model,
+    )
+    min_block_chars = args.min_block_chars
+    audio_q = queue.Queue(maxsize=args.audio_queue)
+    chunk_q = queue.Queue(maxsize=args.chunk_queue)
+    translation_q = queue.Queue(maxsize=args.translation_queue)
+
+    print("Loading translator...")
+    translator = build_translator(args)
+    print(
+        f"Start: {info['name']} -> Whisper {args.whisper} -> "
+        f"OpenAI {args.ollama_model} -> {args.target}"
+    )
+
+    overlay = (
+        ConsoleOverlay(stop_event, show_partial=args.show_partial)
+        if args.no_window
+        else GlassOverlay(
+            stop_event,
+            settings=settings,
+            title="Live Translation",
+            width=args.width,
+            height=args.height,
+            opacity=args.opacity,
+            show_partial=args.show_partial,
+        )
+    )
+    overlay.reset_gen = reset_gen
+
+    workers = [
+        threading.Thread(
+            target=audio_capture_worker,
+            args=(audio_q, stop_event, device, samplerate, channels, args.block_seconds),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=translation_worker,
+            args=(translation_q, overlay, translator, stop_event, settings, reset_gen),
+            daemon=True,
+        ),
+    ]
+    if args.legacy_chunking:
+        workers += [
+            threading.Thread(
+                target=chunk_worker,
+                args=(
+                    audio_q,
+                    chunk_q,
+                    overlay,
+                    stop_event,
+                    samplerate,
+                    args.chunk_seconds,
+                    args.overlap_seconds,
+                    args.endpointing_ms,
+                    args.silence_rms,
+                    not args.no_vad,
+                    args.min_chunk_seconds,
+                    args.pause_emit_ms,
+                    reset_gen,
+                    args.vad_min_speech_ms,
+                ),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=transcribe_translate_worker,
+                args=(
+                    chunk_q,
+                    translation_q,
+                    overlay,
+                    stop_event,
+                    samplerate,
+                    settings,
+                    not args.no_sentence_mode,
+                    min_block_chars,
+                    args.max_block_chars,
+                    args.max_sentences,
+                    args.mutable_tail_seconds,
+                    args.endpointing_ms,
+                    args.endpoint_min_words,
+                    args.max_partial_seconds,
+                    not args.no_word_timestamps,
+                    reset_gen,
+                ),
+                daemon=True,
+            ),
+        ]
+    else:
+        workers.append(
+            threading.Thread(
+                target=streaming_worker,
+                args=(
+                    audio_q,
+                    translation_q,
+                    overlay,
+                    translator,
+                    stop_event,
+                    samplerate,
+                    settings,
+                    min_block_chars,
+                    args.max_block_chars,
+                    args.max_sentences,
+                    args.endpoint_min_words,
+                    args.endpointing_ms,
+                    args.silence_rms,
+                    reset_gen,
+                    not args.no_vad,
+                    args.vad_min_speech_ms,
+                    args.update_seconds,
+                    args.block_seconds,
+                ),
+                daemon=True,
+            )
+        )
+
+    def handle_signal(signum, frame):
+        overlay.stop()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    for worker in workers:
+        worker.start()
+
+    try:
+        overlay.run()
+    finally:
+        stop_event.set()
+
+
+if __name__ == "__main__":
+    main()
