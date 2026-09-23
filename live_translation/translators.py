@@ -258,3 +258,45 @@ class OllamaTranslator:
             if stream:
                 return self._translate_stream(req, on_delta)
             with urllib.request.urlopen(req, timeout=120) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                "Ollama is not responding. Run `ollama serve` and pull the model: "
+                f"`ollama pull {self.model}`."
+            ) from exc
+        response = body.get("message", {}).get("content", "")
+        return strip_llm_noise(response)
+
+    def _translate_stream(self, req, on_delta, throttle_seconds=0.1):
+        """Read Ollama's newline-delimited streaming response, forwarding the growing
+        translation to on_delta (throttled), and return the final cleaned text."""
+        parts = []
+        last_emit = 0.0
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line:
+                        continue
+                    chunk = json.loads(line)
+                    delta = chunk.get("message", {}).get("content", "")
+                    if delta:
+                        parts.append(delta)
+                        now = time.monotonic()
+                        if now - last_emit >= throttle_seconds:
+                            last_emit = now
+                            with contextlib.suppress(Exception):
+                                on_delta(strip_llm_noise("".join(parts)))
+                    if chunk.get("done"):
+                        break
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                "Ollama is not responding. Run `ollama serve` and pull the model: "
+                f"`ollama pull {self.model}`."
+            ) from exc
+        final = strip_llm_noise("".join(parts))
+        # Throttling may have skipped the last tokens — push the complete text once so the
+        # live draft is whole even if the commit that follows is briefly delayed.
+        with contextlib.suppress(Exception):
+            on_delta(final)
+        return final
