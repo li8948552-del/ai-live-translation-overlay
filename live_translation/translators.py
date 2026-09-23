@@ -101,6 +101,9 @@ class OpenAITranslator:
             "model": self.model,
             "input": response_input,
             "max_output_tokens": int(max_tokens or self.max_tokens),
+            # Live translation is a tightly scoped task. Disabling reasoning keeps the
+            # small latency-oriented output budget available for visible translated text.
+            "reasoning": {"effort": "none"},
             "store": False,
         }
         req = urllib.request.Request(
@@ -126,15 +129,30 @@ class OpenAITranslator:
             ) from exc
 
         parts = []
-        for output in body.get("output", []):
-            if output.get("type") != "message":
-                continue
-            for content in output.get("content", []):
-                if content.get("type") == "output_text" and content.get("text"):
-                    parts.append(content["text"])
+        top_level_text = body.get("output_text")
+        if isinstance(top_level_text, str) and top_level_text:
+            parts.append(top_level_text)
+        else:
+            for output in body.get("output", []):
+                if output.get("type") != "message":
+                    continue
+                for content in output.get("content", []):
+                    if (
+                        content.get("type") in {"output_text", "text"}
+                        and content.get("text")
+                    ):
+                        parts.append(content["text"])
         result = strip_llm_noise("".join(parts))
         if not result:
-            raise RuntimeError("OpenAI API returned no translated text.")
+            incomplete = body.get("incomplete_details") or {}
+            if body.get("status") == "incomplete":
+                reason = incomplete.get("reason", "unknown reason")
+                raise RuntimeError(
+                    f"OpenAI response was incomplete ({reason}) and contained no translated text."
+                )
+            raise RuntimeError(
+                f"OpenAI API returned no translated text (status: {body.get('status', 'unknown')})."
+            )
         if on_delta is not None:
             with contextlib.suppress(Exception):
                 on_delta(result)
@@ -240,45 +258,3 @@ class OllamaTranslator:
             if stream:
                 return self._translate_stream(req, on_delta)
             with urllib.request.urlopen(req, timeout=120) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.URLError as exc:
-            raise RuntimeError(
-                "Ollama is not responding. Run `ollama serve` and pull the model: "
-                f"`ollama pull {self.model}`."
-            ) from exc
-        response = body.get("message", {}).get("content", "")
-        return strip_llm_noise(response)
-
-    def _translate_stream(self, req, on_delta, throttle_seconds=0.1):
-        """Read Ollama's newline-delimited streaming response, forwarding the growing
-        translation to on_delta (throttled), and return the final cleaned text."""
-        parts = []
-        last_emit = 0.0
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                for raw_line in resp:
-                    line = raw_line.decode("utf-8").strip()
-                    if not line:
-                        continue
-                    chunk = json.loads(line)
-                    delta = chunk.get("message", {}).get("content", "")
-                    if delta:
-                        parts.append(delta)
-                        now = time.monotonic()
-                        if now - last_emit >= throttle_seconds:
-                            last_emit = now
-                            with contextlib.suppress(Exception):
-                                on_delta(strip_llm_noise("".join(parts)))
-                    if chunk.get("done"):
-                        break
-        except urllib.error.URLError as exc:
-            raise RuntimeError(
-                "Ollama is not responding. Run `ollama serve` and pull the model: "
-                f"`ollama pull {self.model}`."
-            ) from exc
-        final = strip_llm_noise("".join(parts))
-        # Throttling may have skipped the last tokens — push the complete text once so the
-        # live draft is whole even if the commit that follows is briefly delayed.
-        with contextlib.suppress(Exception):
-            on_delta(final)
-        return final
