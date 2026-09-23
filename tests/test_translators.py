@@ -1,6 +1,6 @@
 import json
 
-from live_translation.translators import OllamaTranslator
+from live_translation.translators import OllamaTranslator, OpenAITranslator
 
 
 class FakeResponse:
@@ -15,6 +15,58 @@ class FakeResponse:
 
     def read(self):
         return json.dumps(self.body).encode("utf-8")
+
+
+def test_openai_translation_disables_reasoning_and_reads_output_text(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return FakeResponse(
+            {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "output_text", "text": "你好，欢迎收看。"}
+                        ],
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    translator = OpenAITranslator(source="ja", target="zh", max_tokens=180)
+
+    assert translator.translate("こんにちは") == "你好，欢迎收看。"
+    assert captured["timeout"] == 45
+    assert captured["payload"]["reasoning"] == {"effort": "none"}
+    assert captured["payload"]["max_output_tokens"] == 180
+
+
+def test_openai_translation_reports_output_token_exhaustion(monkeypatch):
+    def fake_urlopen(req, timeout):
+        return FakeResponse(
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{"type": "reasoning"}],
+            }
+        )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    translator = OpenAITranslator(source="ja", target="zh", max_tokens=180)
+
+    try:
+        translator.translate("こんにちは")
+    except RuntimeError as exc:
+        assert "max_output_tokens" in str(exc)
+    else:
+        raise AssertionError("expected an incomplete-response error")
 
 
 def test_ollama_qwen_uses_chat_api_and_disables_thinking(monkeypatch):
